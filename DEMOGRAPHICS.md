@@ -19,7 +19,7 @@ The simulation now models a population that can reproduce and turn over across g
 `persons` gains age/sex/parent/partner/household/generation fields. Additional tables:
 
 - `households`
-- `household_members 
+- `household_members`
 - `life_events`
 - `demographic_stats`
 
