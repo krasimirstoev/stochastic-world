@@ -3,6 +3,7 @@ from .hybrid import PRIORITY_HIGH, PRIORITY_MANDATORY, PRIORITY_NORMAL
 from .life_hybrid import LifeHybridEngine
 from .life_world import LifeWorld
 from .labor_market import BUSINESS_INTERVAL_DAYS
+from .performance import PhaseProfiler
 from .politics import ELECTION_INTERVAL_DAYS
 from .professions import MOBILITY_INTERVAL_DAYS
 
@@ -11,7 +12,8 @@ class HybridWorld(LifeWorld):
     """Priority-budgeted hybrid world with age-structured demographic turnover."""
 
     def __init__(self, *args, hybrid_sample_per_district=256, hybrid_interest_days=30,
-                 hybrid_target_explicit=0.03, hybrid_max_explicit=0.05, **kwargs):
+                 hybrid_target_explicit=0.03, hybrid_max_explicit=0.05,
+                 profile_periodic=False, **kwargs):
         super().__init__(*args, **kwargs)
         self.engine_mode = "hybrid"
         self.hybrid = LifeHybridEngine(
@@ -22,6 +24,7 @@ class HybridWorld(LifeWorld):
             max_explicit_fraction=hybrid_max_explicit,
         )
         self.last_hybrid_stats = dict(self.hybrid.last_stats)
+        self.profiler = PhaseProfiler(self, enabled=profile_periodic)
 
     def remember_interaction(self, actor, target, action, magnitude=1.0):
         super().remember_interaction(actor, target, action, magnitude)
@@ -52,53 +55,82 @@ class HybridWorld(LifeWorld):
 
     def run_day(self, day):
         self.current_day = day
+        day_started = self.profiler.start_day()
+
         if day == 1 or (day - 1) % ELECTION_INTERVAL_DAYS == 0:
-            self.run_election()
-        active_ids = self.hybrid.select_active(day)
-        self.last_hybrid_stats = self.hybrid.aggregate_background(day, active_ids)
-        for pid in active_ids:
-            person = self.people[pid]
-            if not person.alive:
-                continue
-            self.hybrid.catch_up(person, day)
-            if person.health <= 0:
-                self.kill(person, "hybrid_catchup")
-                continue
-            if day >= person.detained_until_day:
-                for _ in range(self.actions_per_day):
-                    if person.alive and day >= person.detained_until_day:
-                        self.perform_action(person)
-        for location in self.locations:
-            self.crime_history[location.id].append(self.daily_crimes.get(location.id, 0))
-        rates = self.crime_rates()
-        for pid in active_ids:
-            person = self.people[pid]
-            if not person.alive:
-                continue
-            self._end_selected_person(person, rates)
-            if person.alive:
-                self.hybrid.touch_after_day(person, day)
-        self.daily_crimes.clear()
-        for shipment in self.transport.rebalance(day):
-            self.store.shipment(shipment)
+            with self.profiler.phase(day, "election"):
+                self.run_election()
+
+        with self.profiler.phase(day, "hybrid_select"):
+            active_ids = self.hybrid.select_active(day)
+
+        with self.profiler.phase(day, "hybrid_aggregate"):
+            self.last_hybrid_stats = self.hybrid.aggregate_background(day, active_ids)
+
+        with self.profiler.phase(day, "explicit_actions"):
+            for pid in active_ids:
+                person = self.people[pid]
+                if not person.alive:
+                    continue
+                self.hybrid.catch_up(person, day)
+                if person.health <= 0:
+                    self.kill(person, "hybrid_catchup")
+                    continue
+                if day >= person.detained_until_day:
+                    for _ in range(self.actions_per_day):
+                        if person.alive and day >= person.detained_until_day:
+                            self.perform_action(person)
+
+        with self.profiler.phase(day, "selected_end_of_day"):
+            for location in self.locations:
+                self.crime_history[location.id].append(self.daily_crimes.get(location.id, 0))
+            rates = self.crime_rates()
+            for pid in active_ids:
+                person = self.people[pid]
+                if not person.alive:
+                    continue
+                self._end_selected_person(person, rates)
+                if person.alive:
+                    self.hybrid.touch_after_day(person, day)
+            self.daily_crimes.clear()
+
+        with self.profiler.phase(day, "transport"):
+            for shipment in self.transport.rebalance(day):
+                self.store.shipment(shipment)
+
         if day % BUSINESS_INTERVAL_DAYS == 0:
-            self.welfare_cycle()
-            self.business_cycle()
-            self.police.rebalance()
-        self.goods_market.reprice()
+            with self.profiler.phase(day, "welfare"):
+                self.welfare_cycle()
+            with self.profiler.phase(day, "business"):
+                self.business_cycle()
+            with self.profiler.phase(day, "police_rebalance"):
+                self.police.rebalance()
+
+        with self.profiler.phase(day, "market_reprice"):
+            self.goods_market.reprice()
+
         if day % MOBILITY_INTERVAL_DAYS == 0:
-            self.mobility_cycle()
+            with self.profiler.phase(day, "mobility"):
+                self.mobility_cycle()
+
         if day % DEMOGRAPHIC_INTERVAL_DAYS == 0:
-            self.demographics.cycle(day)
-        police_snapshot = self.police.end_day()
-        self.store.write_daily_stats(day, self)
-        self.store.write_location_stats(day, self)
-        self.store.write_political_stats(day, self)
-        self.store.write_social_stats(day, self)
-        self.store.write_labor_stats(day, self)
-        self.store.write_market_stats(day, self)
-        self.store.write_police_stats(day, police_snapshot)
-        self.store.write_hybrid_stats(day, self.last_hybrid_stats)
-        if day % DEMOGRAPHIC_INTERVAL_DAYS == 0:
-            self.demographics.write_stats(day)
-        self.store.commit_day()
+            with self.profiler.phase(day, "demographics"):
+                self.demographics.cycle(day)
+
+        with self.profiler.phase(day, "statistics"):
+            police_snapshot = self.police.end_day()
+            self.store.write_daily_stats(day, self)
+            self.store.write_location_stats(day, self)
+            self.store.write_political_stats(day, self)
+            self.store.write_social_stats(day, self)
+            self.store.write_labor_stats(day, self)
+            self.store.write_market_stats(day, self)
+            self.store.write_police_stats(day, police_snapshot)
+            self.store.write_hybrid_stats(day, self.last_hybrid_stats)
+            if day % DEMOGRAPHIC_INTERVAL_DAYS == 0:
+                self.demographics.write_stats(day)
+
+        with self.profiler.phase(day, "commit"):
+            self.store.commit_day()
+
+        self.profiler.finish_day(day, day_started)

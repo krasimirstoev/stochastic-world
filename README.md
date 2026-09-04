@@ -145,35 +145,73 @@ ORDER BY day;
 
 The pending count is intentional: it shows how much lower-priority social state is waiting outside the explicit budget.
 
-## Recommended benchmark
+## Periodic O(N) profiling
 
-After the earlier 10k run showed roughly 98% explicit population, rerun the same scale after this change:
+Before introducing multiprocessing, measure which phases still dominate wall-clock time:
 
 ```bash
-time python3 world.py \
-  --population 10000 \
+python3 world.py \
+  --population 100000 \
   --actions-per-day 1 \
-  --period 100 \
+  --period 180 \
   --engine hybrid \
-  --seed 12345
+  --seed 12345 \
+  --profile-periodic
 ```
 
-Expected healthy default behavior is approximately 3-5% explicit unless mandatory P0 states genuinely become widespread.
+The 180-day run includes the day-1 election, six welfare/business/demographic cycles and one mobility cycle.
 
-Then inspect:
+The profiler measures `day_total` plus these phases independently:
+
+```text
+election
+hybrid_select
+hybrid_aggregate
+explicit_actions
+selected_end_of_day
+transport
+welfare
+business
+police_rebalance
+market_reprice
+mobility
+demographics
+statistics
+commit
+```
+
+At the end of each run the CLI prints calls, total time, average time, p95 and maximum time per phase. Timings are also persisted to `performance_timings` only when `--profile-periodic` is enabled.
+
+Useful aggregate query:
 
 ```sql
 SELECT
-    AVG(explicit_agents),
-    MAX(explicit_agents),
-    AVG(aggregated_agents),
-    AVG(mandatory_agents),
-    AVG(high_priority_agents),
-    MAX(pending_interesting)
-FROM hybrid_stats;
+    phase,
+    COUNT(*) AS calls,
+    ROUND(SUM(duration_seconds), 3) AS total_seconds,
+    ROUND(AVG(duration_seconds), 4) AS avg_seconds,
+    ROUND(MAX(duration_seconds), 4) AS max_seconds
+FROM performance_timings
+WHERE simulation_id = 1
+GROUP BY phase
+ORDER BY total_seconds DESC;
 ```
 
-If explicit stays near target and performance improves, the next benchmark should scale to 100k and then 2M.
+To inspect only the known periodic O(N) candidates:
+
+```sql
+SELECT day, phase, duration_seconds, population_alive, explicit_agents
+FROM performance_timings
+WHERE simulation_id = 1
+  AND phase IN ('election', 'welfare', 'mobility', 'business', 'demographics')
+ORDER BY day, phase;
+```
+
+`--profile-periodic` currently targets the hybrid engine. The profiler buffers measurements in memory and writes them after the run so SQLite timing writes do not contaminate the measured simulation phases.
+
+## Recommended benchmark
+
+A healthy hybrid run should keep the explicit pool near the configured target unless mandatory P0 states genuinely become widespread. After confirming that behavior, use the 100k × 180-day profiling run above before changing the execution architecture.
 
 ## Reproducibility
 
@@ -185,8 +223,8 @@ The same seed and CLI configuration reproduce a run within the same engine mode.
 PYTHONPATH=. python3 -m unittest discover -s tests -v
 ```
 
-The hybrid budget tests verify the 3% target, 5% high-priority ceiling and mandatory P0 overflow behavior.
+The hybrid budget tests verify the 3% target, 5% high-priority ceiling and mandatory P0 overflow behavior. Profiling tests verify disabled-mode zero recording, summary aggregation and SQLite persistence.
 
 ## Next scaling step
 
-Once the hybrid explicit pool stays bounded, profile the remaining periodic O(N) work: elections, welfare and mobility. Only after that should district-local persistent multiprocessing workers be introduced.
+Use `performance_timings` to determine whether elections, welfare, mobility or another measured phase dominates the remaining runtime. Only after that evidence should district-local persistent multiprocessing workers be introduced.

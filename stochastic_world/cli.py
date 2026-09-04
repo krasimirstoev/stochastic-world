@@ -30,6 +30,8 @@ def parse_args():
     p.add_argument("--hybrid-interest-days", type=int, default=30)
     p.add_argument("--hybrid-target-explicit", type=float, default=0.03)
     p.add_argument("--hybrid-max-explicit", type=float, default=0.05)
+    p.add_argument("--profile-periodic", action="store_true",
+                   help="Profile hybrid phases and persist timings to performance_timings.")
     p.add_argument("--no-progress", action="store_true")
     p.add_argument("--quiet", action="store_true")
     return p.parse_args()
@@ -39,6 +41,19 @@ def resolve_engine(args):
     if args.engine != "auto":
         return args.engine
     return "hybrid" if args.population >= 100_000 else "agent"
+
+
+def _print_profile_summary(world):
+    rows = world.profiler.summary()
+    if not rows:
+        return
+    tqdm.write("  performance profile (wall clock):")
+    for row in rows:
+        tqdm.write(
+            f"    {row['phase']:<20} calls={row['calls']:>5} "
+            f"total={row['total']:>8.3f}s avg={row['avg']:>8.4f}s "
+            f"p95={row['p95']:>8.4f}s max={row['max']:>8.4f}s"
+        )
 
 
 def run_once(args, master_seed, run_seed, run_index, progress, engine):
@@ -58,7 +73,8 @@ def run_once(args, master_seed, run_seed, run_index, progress, engine):
         world_kwargs.update(hybrid_sample_per_district=args.hybrid_sample_per_district,
                             hybrid_interest_days=args.hybrid_interest_days,
                             hybrid_target_explicit=args.hybrid_target_explicit,
-                            hybrid_max_explicit=args.hybrid_max_explicit)
+                            hybrid_max_explicit=args.hybrid_max_explicit,
+                            profile_periodic=args.profile_periodic)
     world = world_cls(rng, args.population, args.actions_per_day, store, run_seed, args.locale, **world_kwargs)
     if engine == "agent":
         world.engine_mode = "agent"
@@ -81,6 +97,10 @@ def run_once(args, master_seed, run_seed, run_index, progress, engine):
             collapse = day; break
     if progress is not None and last < args.period:
         progress.update(args.period - last)
+    if engine == "hybrid" and args.profile_periodic:
+        world.profiler.flush(store)
+        if not args.quiet:
+            _print_profile_summary(world)
     store.finish(collapse)
     if not args.quiet:
         tqdm.write(f"  finished day={last} alive={world.alive_count} births={world.demographics.total_births} "
@@ -109,9 +129,11 @@ def main():
     if not args.hybrid_target_explicit <= args.hybrid_max_explicit <= 1:
         raise SystemExit("hybrid-max-explicit must be >= target and <= 1")
     engine = resolve_engine(args)
+    if args.profile_periodic and engine != "hybrid":
+        raise SystemExit("--profile-periodic currently requires --engine hybrid (or auto at population >= 100000)")
     master, _ = make_rng(args.seed); seeds = derive_run_seeds(master, args.runs)
     resolved_locations = args.locations if args.locations > 0 else recommended_location_count(args.population, args.target_neighborhood_size)
-    print(f"Master seed: {master}\nRuns: {args.runs}\nPopulation: {args.population:,}\nActions/day: {args.actions_per_day}\nDistricts: {resolved_locations} ({'manual' if args.locations else 'auto'})\nEngine: {engine}\nDemographics: enabled\n")
+    print(f"Master seed: {master}\nRuns: {args.runs}\nPopulation: {args.population:,}\nActions/day: {args.actions_per_day}\nDistricts: {resolved_locations} ({'manual' if args.locations else 'auto'})\nEngine: {engine}\nDemographics: enabled\nProfiling: {'periodic phases' if args.profile_periodic else 'off'}\n")
     progress = None
     if not args.no_progress:
         progress = tqdm(total=args.runs * args.period, desc="Simulation", unit="day", dynamic_ncols=True, smoothing=0.1)
