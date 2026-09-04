@@ -8,15 +8,7 @@ from .professions import PROFESSIONS
 
 
 class AggressiveParallelAgentWorld(ParallelAgentWorld):
-    """Opt-in throughput-first agent engine with persistent day shards.
-
-    Workers plan all action rounds for their fixed pid shard in one dispatch per
-    simulated day. Main remains authoritative for shared-state mutations.
-
-    Aggressive mode also records coarse wall-clock timings so expensive IPC and
-    synchronization phases can be identified without cProfile distorting worker
-    behavior.
-    """
+    """Opt-in throughput-first agent engine with persistent day shards."""
 
     def __init__(self, *args, agent_workers=0, agent_worker_min_active=64, **kwargs):
         super().__init__(
@@ -36,6 +28,7 @@ class AggressiveParallelAgentWorld(ParallelAgentWorld):
         self._aggressive_calls = defaultdict(int)
         self._intent_seconds = defaultdict(float)
         self._intent_calls = defaultdict(int)
+        self._help_memory_batch = None
 
     def _record_phase(self, phase, started):
         self._aggressive_seconds[phase] += perf_counter() - started
@@ -166,8 +159,57 @@ class AggressiveParallelAgentWorld(ParallelAgentWorld):
             )
         self.next_sequence()
 
+    def _queue_help_memory(self, observer, other, role, magnitude):
+        batch = self._help_memory_batch
+        if batch is None:
+            if role == "witness":
+                observer.observe(other, self.current_day, "help", magnitude)
+            else:
+                observer.remember(other, self.current_day, "help", role, magnitude)
+            return
+        key = (observer.id, other.id, role)
+        entry = batch.get(key)
+        if entry is None:
+            batch[key] = [1, float(magnitude)]
+        else:
+            entry[0] += 1
+            entry[1] += float(magnitude)
+
+    def _flush_help_memory_batch(self):
+        batch = self._help_memory_batch
+        if not batch:
+            self._help_memory_batch = None
+            return
+        started = perf_counter()
+        day = self.current_day
+        people = self.people
+        for (observer_id, other_id, role), (count, magnitude) in batch.items():
+            if observer_id >= len(people) or other_id >= len(people):
+                continue
+            observer = people[observer_id]
+            other = people[other_id]
+            memory = observer.memory_of(other, day)
+            old_affinity = memory.affinity
+            old_conflict = memory.conflict_score
+            memory.familiarity += count
+            memory.last_day = day
+            if role == "actor":
+                memory.help_given += count
+                memory.trust += 4.0 * magnitude
+            elif role == "target":
+                memory.help_received += count
+                memory.trust += 8.0 * magnitude
+                memory.grievance -= 3.0 * magnitude
+            else:
+                memory.observed_help += count
+                memory.trust += 2.5 * magnitude
+            memory._clamp()
+            observer._update_contribution(memory, old_affinity, old_conflict)
+        self._help_memory_batch = None
+        self._record_phase("flush_help_memory", started)
+
     def _apply_prepared_social(self, person, prepared):
-        """Skip the filtered compact help event while preserving social state."""
+        """Fast help path; direct relationship bookkeeping is batched per day."""
         _pid, action, target_id, payload, witness_ids = prepared
         if action != "help":
             return super()._apply_prepared_social(person, prepared)
@@ -200,8 +242,8 @@ class AggressiveParallelAgentWorld(ParallelAgentWorld):
 
         self.total_helps += 1
         magnitude = float(amount)
-        person.remember(target, self.current_day, action, "actor", magnitude)
-        target.remember(person, self.current_day, action, "target", magnitude)
+        self._queue_help_memory(person, target, "actor", magnitude)
+        self._queue_help_memory(target, person, "target", magnitude)
         for witness_id in witness_ids:
             if witness_id >= len(self.people):
                 continue
@@ -211,7 +253,7 @@ class AggressiveParallelAgentWorld(ParallelAgentWorld):
                 and witness.location_id == person.location_id
                 and witness.id not in (person.id, target.id)
             ):
-                witness.observe(person, self.current_day, action, magnitude)
+                self._queue_help_memory(witness, person, "witness", magnitude)
                 self.total_observations += 1
 
     def _run_parallel_actions(self, day):
@@ -272,6 +314,7 @@ class AggressiveParallelAgentWorld(ParallelAgentWorld):
             self._apply_local_state(person, planned[0])
         self._record_phase("apply_local_state", started)
 
+        self._help_memory_batch = {}
         started = perf_counter()
         for round_index in range(self.actions_per_day):
             for pid in eligible_order:
@@ -300,6 +343,7 @@ class AggressiveParallelAgentWorld(ParallelAgentWorld):
                     self._execute_shared_intent(person, action)
                     self._record_intent(action, intent_started)
         self._record_phase("apply_intents", started)
+        self._flush_help_memory_batch()
         self._record_phase("actions_total", total_started)
 
     def aggressive_profile_summary(self):
