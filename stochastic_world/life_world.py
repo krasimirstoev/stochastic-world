@@ -32,6 +32,7 @@ class LifeWorld(World):
     def add_person(self, person):
         if person.id != len(self.people):
             raise ValueError("new person_id must append contiguously")
+        person.memory_cap = getattr(self, "memory_cap", person.memory_cap)
         self.people.append(person)
         self.population_index.add(person.id, person.location_id)
         self.alive_count += 1
@@ -59,9 +60,6 @@ class LifeWorld(World):
         if not person.is_adult:
             return
         if not person.is_working_age:
-            # Retired adults do not use profession-dependent work/move paths and
-            # do not participate in the routine crime action pool. They retain
-            # household, care and consumption behavior.
             action = self.decision_engine.choose_action(person, self.rng, self.location_of(person))
             handler = {
                 "scavenge": self.scavenge,

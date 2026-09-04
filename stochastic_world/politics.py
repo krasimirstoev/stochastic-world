@@ -30,12 +30,20 @@ class PoliticalSystem:
         fake = Faker(locale); fake.seed_instance(seed ^ 0xA11CE)
         self.representatives = {party.id: fake.name() for party in PARTIES}
         self.government = LEFT if seed % 2 == 0 else RIGHT
+        self.initial_government = None
         self.election_number = 0
         self.treasury = 0.0
         self.last_election_day = 0
 
     def party_by_id(self, party_id):
         return LEFT if party_id == "left" else RIGHT
+
+    def force_initial_government(self, party_id):
+        if party_id not in ("left", "right"):
+            self.initial_government = None
+            return
+        self.initial_government = party_id
+        self.government = self.party_by_id(party_id)
 
     def vote(self, person, local_crime_rate: float, rng):
         left_score = -abs(person.ideology - LEFT.ideology)
@@ -84,7 +92,10 @@ class PoliticalSystem:
             if not person.alive or not getattr(person, "is_adult", True): continue
             party = self.vote(person, crime_rate_by_location.get(person.location_id, 0.0), rng)
             votes[party.id] += 1; ballots.append((person, party))
-        winner_id = "left" if votes["left"] >= votes["right"] else "right"
+        if day == 1 and self.initial_government in ("left", "right"):
+            winner_id = self.initial_government
+        else:
+            winner_id = "left" if votes["left"] >= votes["right"] else "right"
         self.government = self.party_by_id(winner_id)
         self.election_number += 1; self.last_election_day = day
         return votes, ballots, self.government

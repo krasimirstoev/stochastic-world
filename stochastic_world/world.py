@@ -61,11 +61,14 @@ class World:
         if not candidates:return None
         weights=[]
         for target in candidates:
-            memory=actor.memory_of(target)
-            if mode=="help":value=1+max(0,memory.affinity)/10+memory.familiarity/20
-            elif mode=="attack":value=1+memory.conflict_score/5
+            memory=actor.memories.get(target.id)
+            if mode=="help":
+                value=1 if memory is None else 1+max(0,memory.affinity)/10+memory.familiarity/20
+            elif mode=="attack":
+                value=1 if memory is None else 1+memory.conflict_score/5
             else:
-                wealth=target.food+target.medicine*2+max(0,target.money)/4;value=1+memory.conflict_score/18+max(0,-memory.affinity)/30+wealth/25
+                wealth=target.food+target.medicine*2+max(0,target.money)/4
+                value=1+wealth/25 if memory is None else 1+memory.conflict_score/18+max(0,-memory.affinity)/30+wealth/25
             weights.append(max(0.1,value))
         return self.rng.choices(candidates,weights=weights,k=1)[0]
 
