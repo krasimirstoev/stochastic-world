@@ -206,7 +206,8 @@ class ParallelAgentWorld(LifeWorld):
         person.lifetime_unemployment_days += lifetime_unemployment_increment
         if ideology_shift:
             person.shift_ideology(ideology_shift)
-        person.decay_memories(self.current_day)
+        # Agent mode keeps relationship decay fully lazy. Individual memories
+        # materialize to the current day only when they are read or mutated.
         if damage:
             self.store.event(
                 self.current_day,
