@@ -1,69 +1,33 @@
-import os
-from collections import defaultdict
-
+from .agent_coarse import AgentCoarsePool
 from .demographics import DEMOGRAPHIC_INTERVAL_DAYS
 from .labor_market import BUSINESS_INTERVAL_DAYS
 from .life_world import LifeWorld
-from .multiprocessing_engine import PersistentDistrictPool
 from .politics import ELECTION_INTERVAL_DAYS
 from .population_index import permutation_ids
 from .professions import MOBILITY_INTERVAL_DAYS
 
 
-class AgentWorkerPool(PersistentDistrictPool):
-    """Persistent pool that shards full-agent work by person rather than district."""
-
-    def __init__(self, master_seed, location_count, workers=0, min_active=1024):
-        super().__init__(master_seed, location_count, workers=workers, min_active=min_active)
-        requested = max(0, int(workers))
-        if requested > 0:
-            self.worker_count = min(requested, os.cpu_count() or requested)
-            self.enabled = self.worker_count >= 2
-
-    def _person_shards(self, snapshots, pid_index=0):
-        rows_by_worker = defaultdict(list)
-        for row in snapshots:
-            pid = row[pid_index]
-            rows_by_worker[int(pid) % self.worker_count].append(row)
-        return rows_by_worker
-
-    def plan_agent_actions(self, day, round_index, snapshots):
-        return self._dispatch(
-            "actions",
-            day,
-            round_index,
-            self._person_shards(snapshots, pid_index=0),
-        )
-
-    def plan_agent_end_of_day(self, day, snapshots):
-        rows_by_worker = defaultdict(list)
-        for _district_id, row in snapshots:
-            rows_by_worker[int(row[0]) % self.worker_count].append(row)
-        return self._dispatch("end_of_day", day, 0, rows_by_worker)
-
-
 class ParallelAgentWorld(LifeWorld):
-    """Full-agent world with deterministic multiprocessing for planning-heavy phases.
+    """Full-agent world with deterministic coarse-grained multiprocessing.
 
-    Workers never mutate the authoritative world. They plan one synchronous action
-    round at a time and compute end-of-day deltas from primitive snapshots. The
-    main process applies results in deterministic person order and remains the only
-    SQLite writer.
+    Workers execute agent-local actions completely and return compact state
+    deltas. Shared-state actions remain intents applied by the authoritative main
+    process in deterministic agent order. SQLite remains single-writer.
     """
 
     def __init__(self, *args, agent_workers=0, agent_worker_min_active=1024, **kwargs):
         super().__init__(*args, **kwargs)
         self.engine_mode = "agent"
         seed = args[4] if len(args) > 4 else kwargs.get("population_seed", 0)
-        self.district_pool = AgentWorkerPool(
+        self.district_pool = AgentCoarsePool(
             seed,
-            len(self.locations),
             workers=agent_workers,
             min_active=agent_worker_min_active,
         )
 
     def _action_snapshot(self, person):
         memory = person.aggregate_memory()
+        location = self.location_of(person)
         return (
             person.id,
             person.location_id,
@@ -74,23 +38,22 @@ class ParallelAgentWorld(LifeWorld):
             person.shelter,
             person.money,
             person.employer_id is not None,
-            self.location_of(person).kind,
+            location.kind,
             memory["positive_ties"],
             memory["hostile_ties"],
             memory["max_conflict"],
             memory["mean_affinity"],
+            location.scavenge_food_max,
+            location.medicine_chance,
+            person.is_working_age,
         )
 
-    def _execute_planned_action(self, person, action):
+    def _execute_shared_intent(self, person, action):
         if not person.alive or self.current_day < person.detained_until_day or not person.is_adult:
             return
         if not person.is_working_age:
             handler = {
-                "scavenge": self.scavenge,
                 "buy_supplies": self.buy_supplies,
-                "rest": self.rest,
-                "heal": self.heal,
-                "repair": self.repair,
                 "help": self.help,
             }.get(action, self.rest)
             handler(person)
@@ -98,17 +61,58 @@ class ParallelAgentWorld(LifeWorld):
         handler = {
             "move": self.move,
             "work": self.work,
-            "scavenge": self.scavenge,
             "buy_supplies": self.buy_supplies,
-            "rest": self.rest,
-            "heal": self.heal,
-            "repair": self.repair,
             "help": self.help,
             "steal": self.steal,
             "attack": self.attack,
         }.get(action)
         if handler:
             handler(person)
+
+    def _apply_safe_result(self, person, result):
+        (
+            _pid, action, _safe,
+            food, medicine, energy, health, shelter, money, event_data,
+        ) = result
+        if not person.alive or self.current_day < person.detained_until_day:
+            return
+
+        person.food = food
+        person.medicine = medicine
+        person.energy = energy
+        person.health = health
+        person.shelter = shelter
+        person.money = money
+
+        if event_data is None:
+            return
+
+        if action == "rest":
+            energy_gain, health_gain = event_data
+            self.store.event(
+                self.current_day, self.next_sequence(), "rest",
+                actor=person, location_id=person.location_id,
+                energy_gain=energy_gain, health_gain=health_gain,
+            )
+        elif action == "heal":
+            (gain,) = event_data
+            self.store.event(
+                self.current_day, self.next_sequence(), "heal",
+                actor=person, location_id=person.location_id, health_gain=gain,
+            )
+        elif action == "repair":
+            (gain,) = event_data
+            self.store.event(
+                self.current_day, self.next_sequence(), "repair",
+                actor=person, location_id=person.location_id, shelter_gain=gain,
+            )
+        elif action == "scavenge":
+            food_found, medicine_found, cost = event_data
+            self.store.event(
+                self.current_day, self.next_sequence(), "scavenge",
+                actor=person, location_id=person.location_id,
+                food_found=food_found, medicine_found=medicine_found, energy_cost=cost,
+            )
 
     def _run_parallel_actions(self, day):
         eligible_order = [
@@ -130,12 +134,21 @@ class ParallelAgentWorld(LifeWorld):
             ]
             if not snapshots:
                 break
-            planned = dict(self.district_pool.plan_agent_actions(day, round_index, snapshots))
+
+            planned = {
+                row[0]: row
+                for row in self.district_pool.plan_round(day, round_index, snapshots)
+            }
+
             for pid in eligible_order:
                 person = self.people[pid]
-                action = planned.get(pid)
-                if action is not None and person.alive and day >= person.detained_until_day:
-                    self._execute_planned_action(person, action)
+                result = planned.get(pid)
+                if result is None or not person.alive or day < person.detained_until_day:
+                    continue
+                if result[2]:
+                    self._apply_safe_result(person, result)
+                else:
+                    self._execute_shared_intent(person, result[1])
 
     def _end_snapshot(self, person, rates):
         location = self.location_of(person)
@@ -157,16 +170,8 @@ class ParallelAgentWorld(LifeWorld):
 
     def _apply_end_delta(self, person, delta):
         (
-            _pid,
-            food,
-            energy,
-            shelter,
-            health,
-            unemployment_days,
-            lifetime_unemployment_increment,
-            ideology_shift,
-            damage,
-            causes,
+            _pid, food, energy, shelter, health, unemployment_days,
+            lifetime_unemployment_increment, ideology_shift, damage, causes,
         ) = delta
         if not person.alive:
             return
@@ -195,7 +200,9 @@ class ParallelAgentWorld(LifeWorld):
 
     def _run_parallel_end_of_day(self):
         for location in self.locations:
-            self.crime_history[location.id].append(self.daily_crimes.get(location.id, 0))
+            self.crime_history[location.id].append(
+                self.daily_crimes.get(location.id, 0)
+            )
         rates = self.crime_rates()
         alive_ids = [p.id for p in self.people if p.alive]
 
@@ -203,14 +210,14 @@ class ParallelAgentWorld(LifeWorld):
             self.demographics.support_dependent(self.people[pid])
 
         snapshots = [
-            (self.people[pid].location_id, self._end_snapshot(self.people[pid], rates))
+            self._end_snapshot(self.people[pid], rates)
             for pid in alive_ids
             if self.people[pid].alive
         ]
-        deltas = dict(
-            (row[0], row)
-            for row in self.district_pool.plan_agent_end_of_day(self.current_day, snapshots)
-        )
+        deltas = {
+            row[0]: row
+            for row in self.district_pool.plan_end_of_day(self.current_day, snapshots)
+        }
         for pid in alive_ids:
             person = self.people[pid]
             delta = deltas.get(pid)

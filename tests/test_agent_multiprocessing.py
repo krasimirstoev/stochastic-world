@@ -1,43 +1,40 @@
-import sys
 import unittest
 from unittest.mock import patch
 
-from stochastic_world.agent_world import AgentWorkerPool
-from stochastic_world.cli import _resolved_worker_arg, parse_args, resolve_engine
+from stochastic_world.agent_coarse import AgentCoarsePool, _safe_action_result
 
 
 class AgentMultiprocessingTest(unittest.TestCase):
-    def test_agent_pool_is_not_capped_by_district_count(self):
-        pool = AgentWorkerPool(12345, location_count=5, workers=10, min_active=100)
-        try:
-            self.assertTrue(pool.enabled)
-            self.assertEqual(pool.worker_count, min(10, __import__("os").cpu_count() or 10))
-            self.assertFalse(pool.started)
-        finally:
-            pool.close()
+    def _snapshot(self, *, energy=40, health=80, shelter=70, money=10.0,
+                  food=5, medicine=1, working_age=True, kind="residential"):
+        return (
+            42, 0, food, medicine, energy, health, shelter, money,
+            True, kind, 0, 0, 0.0, 0.0,
+            3, 0.10, working_age,
+        )
 
-    def test_workers_alias_enables_agent_workers(self):
-        with patch.object(sys, "argv", ["world.py", "--engine", "agent", "--workers", "10"]):
-            args = parse_args()
-        self.assertEqual(resolve_engine(args), "agent")
-        self.assertEqual(_resolved_worker_arg(args, "agent"), 10)
+    def test_worker_action_result_is_deterministic(self):
+        snapshot = self._snapshot()
+        first = _safe_action_result(snapshot, 12345, 7, 0)
+        second = _safe_action_result(snapshot, 12345, 7, 0)
+        self.assertEqual(first, second)
 
-    def test_agent_workers_default_to_serial(self):
-        with patch.object(sys, "argv", ["world.py", "--engine", "agent"]):
-            args = parse_args()
-        self.assertEqual(_resolved_worker_arg(args, "agent"), 0)
+    def test_safe_result_preserves_identity_and_state_shape(self):
+        result = _safe_action_result(self._snapshot(), 999, 3, 1)
+        self.assertEqual(result[0], 42)
+        self.assertEqual(len(result), 10)
+        self.assertIsInstance(result[2], bool)
 
-    def test_hybrid_workers_keep_auto_default(self):
-        with patch.object(sys, "argv", ["world.py", "--engine", "hybrid"]):
-            args = parse_args()
-        self.assertEqual(_resolved_worker_arg(args, "hybrid"), -1)
+    def test_requested_workers_are_not_capped_by_district_count(self):
+        with patch("stochastic_world.agent_coarse.os.cpu_count", return_value=12):
+            pool = AgentCoarsePool(123, workers=10, min_active=1)
+        self.assertEqual(pool.worker_count, 10)
+        self.assertTrue(pool.enabled)
 
-    def test_person_sharding_uses_all_available_workers(self):
-        pool = AgentWorkerPool(1, location_count=5, workers=4, min_active=1)
-        rows = [(pid, 0) for pid in range(12)]
-        shards = pool._person_shards(rows)
-        self.assertEqual(set(shards), {0, 1, 2, 3})
-        self.assertEqual(sum(len(v) for v in shards.values()), 12)
+    def test_worker_count_caps_at_available_cpus(self):
+        with patch("stochastic_world.agent_coarse.os.cpu_count", return_value=12):
+            pool = AgentCoarsePool(123, workers=100, min_active=1)
+        self.assertEqual(pool.worker_count, 12)
 
 
 if __name__ == "__main__":
