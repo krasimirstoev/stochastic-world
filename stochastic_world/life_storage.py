@@ -1,3 +1,4 @@
+from .fast_storage import BufferedEventMixin
 from .hybrid_storage import HybridEventStore
 from .storage import EventStore
 
@@ -11,14 +12,14 @@ def _write_labor_row(store, day, w, employed, workforce_count):
          sum(e.vacancies for e in active), len(active), sum(e.capacity for e in active)))
 
 
-class LifeEventStore(EventStore):
+class LifeEventStore(BufferedEventMixin, EventStore):
     def write_labor_stats(self, day, w):
         workforce = [p for p in w.people if p.alive and p.is_working_age]
         employed = sum(p.employer_id is not None for p in workforce)
         _write_labor_row(self, day, w, employed, len(workforce))
 
 
-class LifeHybridEventStore(HybridEventStore):
+class LifeHybridEventStore(BufferedEventMixin, HybridEventStore):
     def write_labor_stats(self, day, w):
         workforce_count = w.demographics.working_age_count
         active = [e for e in w.labor_market.employers if e.alive]

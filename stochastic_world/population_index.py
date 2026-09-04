@@ -47,42 +47,40 @@ class PopulationIndex:
         bucket = self.members[location_id]
         if not bucket or limit <= 0:
             return []
+
         excluded = set(exclude)
-        usable = len(bucket) - sum(
+        excluded_here = sum(
             1 for pid in excluded
             if 0 <= pid < len(self.positions)
             and self.positions[pid] >= 0
             and self.people[pid].location_id == location_id
         )
+        usable = len(bucket) - excluded_here
         if usable <= 0:
             return []
-
         want = min(limit, usable)
-        result, seen = [], set()
-        attempts = 0
-        max_attempts = max(16, want * 8)
-        while len(result) < want and attempts < max_attempts:
-            pid = bucket[rng.randrange(len(bucket))]
-            attempts += 1
-            if pid in excluded or pid in seen:
-                continue
-            person = self.people[pid]
-            if not person.alive:
-                continue
-            seen.add(pid)
-            result.append(person)
 
-        if len(result) < want and len(bucket) <= max(64, want * 4):
-            for pid in bucket:
-                if len(result) >= want:
-                    break
-                if pid in excluded or pid in seen:
-                    continue
-                person = self.people[pid]
-                if person.alive:
-                    seen.add(pid)
-                    result.append(person)
-        return result
+        # Membership buckets contain living people only: kill() removes a person
+        # and births are explicitly added. Use Random.sample's optimized bounded
+        # sampling rather than repeated randrange/set/retry loops.
+        if want == usable:
+            return [self.people[pid] for pid in bucket if pid not in excluded]
+
+        draw_count = min(len(bucket), want + excluded_here)
+        chosen = rng.sample(bucket, draw_count)
+        result_ids = [pid for pid in chosen if pid not in excluded]
+        if len(result_ids) >= want:
+            return [self.people[pid] for pid in result_ids[:want]]
+
+        # The oversample can theoretically contain every excluded id. Fill the
+        # rare shortfall deterministically without another randomized retry loop.
+        seen = set(chosen)
+        for pid in bucket:
+            if len(result_ids) >= want:
+                break
+            if pid not in excluded and pid not in seen:
+                result_ids.append(pid)
+        return [self.people[pid] for pid in result_ids]
 
 
 def permutation_ids(n: int, rng):
