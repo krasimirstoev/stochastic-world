@@ -1,4 +1,5 @@
 import argparse
+import os
 
 from tqdm import tqdm
 
@@ -31,6 +32,11 @@ def parse_args():
     p.add_argument("--police-per-1000", type=float, default=2.2)
     p.add_argument("--event-mode", choices=("auto", "full", "compact"), default="auto")
     p.add_argument("--engine", choices=("auto", "agent", "hybrid"), default="auto")
+    p.add_argument("--aggressive-parallel", action="store_true",
+                   help=(
+                       "Enable the opt-in maximum-throughput agent mode. When --workers is omitted, "
+                       "all available CPUs are used. This is the killswitch for aggressive parallel features."
+                   ))
     p.add_argument("--initial-government", choices=("auto", "left", "right"), default="auto",
                    help="Force the day-1 government; auto preserves election-driven startup.")
     p.add_argument("--memory-cap", type=int, default=64,
@@ -44,8 +50,9 @@ def parse_args():
     p.add_argument(
         "--workers", "--hybrid-workers", dest="hybrid_workers", type=int, default=-1,
         help=(
-            "Worker processes: agent uses 0 when omitted; hybrid uses auto when omitted. "
-            "0=off, N=exact workers. --hybrid-workers remains a compatibility alias."
+            "Worker processes: agent uses 0 when omitted, except --aggressive-parallel uses all CPUs; "
+            "hybrid uses auto when omitted. 0=off, N=exact workers. "
+            "--hybrid-workers remains a compatibility alias."
         ),
     )
     p.add_argument("--hybrid-worker-min-active", type=int, default=1024,
@@ -78,7 +85,7 @@ def _print_profile_summary(world):
 
 def _resolved_worker_arg(args, engine):
     if engine == "agent" and args.hybrid_workers < 0:
-        return 0
+        return (os.cpu_count() or 1) if args.aggressive_parallel else 0
     return args.hybrid_workers
 
 
@@ -101,6 +108,7 @@ def run_once(args, master_seed, run_seed, run_index, progress, engine):
         "locations_count": locations_count,
         "event_mode": args.event_mode,
         "engine": engine,
+        "aggressive_parallel": args.aggressive_parallel,
         "initial_government": args.initial_government,
         "memory_cap": args.memory_cap,
         "encounter_sample": args.encounter_sample,
@@ -162,6 +170,8 @@ def run_once(args, master_seed, run_seed, run_index, progress, engine):
                 f" | workers={pool.worker_count if pool.enabled else 0}"
                 f" | mp_min_active={pool.min_active}"
             )
+        if args.aggressive_parallel:
+            worker_text += " | aggressive=on"
         tqdm.write(
             f"Run {run_index}/{args.runs} | simulation_id={store.simulation_id} | seed={run_seed} "
             f"| districts={len(world.locations)} | engine={engine} | event_mode={store.event_mode}{worker_text}"
@@ -273,6 +283,10 @@ def main():
         raise SystemExit("hybrid-worker-min-active must be >= 1")
 
     engine = resolve_engine(args)
+    if args.aggressive_parallel and engine != "agent":
+        raise SystemExit("--aggressive-parallel currently requires --engine agent (or auto resolving to agent)")
+    if args.aggressive_parallel and args.event_mode != "compact":
+        raise SystemExit("--aggressive-parallel currently requires --event-mode compact")
     if args.profile_periodic and engine != "hybrid":
         raise SystemExit("--profile-periodic currently requires --engine hybrid (or auto at population >= 100000)")
 
@@ -298,6 +312,7 @@ def main():
         f"Actions/day: {args.actions_per_day}\n"
         f"Districts: {resolved_locations} ({'manual' if args.locations else 'auto'})\n"
         f"Engine: {engine}\n"
+        f"Aggressive parallel: {'on' if args.aggressive_parallel else 'off'}\n"
         f"Demographics: enabled\n"
         f"Initial government: {args.initial_government}\n"
         f"Memory cap: {'unlimited' if args.memory_cap == 0 else args.memory_cap}\n"
