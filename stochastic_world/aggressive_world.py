@@ -4,6 +4,7 @@ from time import perf_counter
 from .agent_shards import PersistentDayShardPool
 from .agent_world import ParallelAgentWorld
 from .population_index import permutation_ids
+from .professions import profession_for, workplace_fit
 
 
 class AggressiveParallelAgentWorld(ParallelAgentWorld):
@@ -64,6 +65,137 @@ class AggressiveParallelAgentWorld(ParallelAgentWorld):
             person.shelter,
             person.money,
         ) = final_state
+
+    def work(self, person):
+        """Compact-mode work path without constructing filtered work/rest events."""
+        if not person.is_working_age:
+            person.energy = min(100, person.energy + self.rng.randint(12, 24))
+            person.health = min(100, person.health + self.rng.randint(0, 2))
+            self.next_sequence()
+            return
+        if person.energy < 8:
+            person.energy = min(100, person.energy + self.rng.randint(12, 24))
+            person.health = min(100, person.health + self.rng.randint(0, 2))
+            self.next_sequence()
+            return
+
+        employer = self.labor_market.employer(person.employer_id)
+        if employer is None:
+            person.employer_id = None
+            hired = self.labor_market.hire(person)
+            if hired:
+                self.store.employment_event(
+                    self.current_day, person, hired, "hired", "job_search"
+                )
+                self.store.event(
+                    self.current_day,
+                    self.next_sequence(),
+                    "job_found",
+                    actor=person,
+                    employer_id=hired.id,
+                    employer=hired.name,
+                )
+            else:
+                self.store.event(
+                    self.current_day,
+                    self.next_sequence(),
+                    "job_search",
+                    actor=person,
+                    location_id=person.location_id,
+                    vacancies=self.labor_market.vacancies(person.location_id),
+                    success=0,
+                )
+            return
+
+        if employer.location_id != person.location_id:
+            return
+
+        location = self.location_of(person)
+        shift = self.labor_market.work_shift(person, location)
+        if shift["insolvent"]:
+            self.labor_market.terminate(person, "insolvent")
+            self.store.employment_event(
+                self.current_day, person, employer, "laid_off", "insolvent"
+            )
+            self.store.event(
+                self.current_day,
+                self.next_sequence(),
+                "layoff",
+                actor=person,
+                employer_id=employer.id,
+                reason="insolvent",
+            )
+            return
+
+        gross = shift["gross"]
+        profession = profession_for(person)
+        fit = workplace_fit(person, location)
+        energy = max(
+            3,
+            round(self.rng.randint(6, 12) * profession.energy_multiplier),
+        )
+        person.money += gross
+        person.lifetime_gross_income += gross
+        person.work_experience += 1
+        person.career_progress += profession.advancement_rate * fit
+        self.politics.collect_tax(person, gross)
+        person.energy = max(0, person.energy - energy)
+        if shift["produced_good"] and shift["produced"] > 0:
+            self.goods_market.add_supply(
+                person.location_id,
+                employer.id,
+                shift["produced_good"],
+                shift["produced"],
+            )
+        self.next_sequence()
+
+    def _apply_prepared_social(self, person, prepared):
+        """Skip the filtered compact help event while preserving social state."""
+        _pid, action, target_id, payload, witness_ids = prepared
+        if action != "help":
+            return super()._apply_prepared_social(person, prepared)
+        if (
+            target_id is None
+            or not person.alive
+            or self.current_day < person.detained_until_day
+            or target_id >= len(self.people)
+        ):
+            return
+
+        target = self.people[target_id]
+        if not target.alive or target.location_id != person.location_id:
+            return
+
+        resource, proposed = payload
+        amount = 0
+        if resource == "medicine" and proposed and person.medicine > 0:
+            amount = 1
+            person.medicine -= 1
+            target.medicine += 1
+        elif resource == "food" and proposed and person.food > 1:
+            amount = min(int(proposed), max(0, person.food - 1))
+            person.food -= amount
+            target.food += amount
+
+        self.next_sequence()
+        if not amount:
+            return
+
+        self.total_helps += 1
+        magnitude = float(amount)
+        person.remember(target, self.current_day, action, "actor", magnitude)
+        target.remember(person, self.current_day, action, "target", magnitude)
+        for witness_id in witness_ids:
+            if witness_id >= len(self.people):
+                continue
+            witness = self.people[witness_id]
+            if (
+                witness.alive
+                and witness.location_id == person.location_id
+                and witness.id not in (person.id, target.id)
+            ):
+                witness.observe(person, self.current_day, action, magnitude)
+                self.total_observations += 1
 
     def _run_parallel_actions(self, day):
         if not self.shard_pool.should_parallelize(self.alive_count):
