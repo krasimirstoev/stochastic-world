@@ -35,8 +35,8 @@ def parse_args():
     p.add_argument("--hybrid-interest-days", type=int, default=30)
     p.add_argument("--hybrid-target-explicit", type=float, default=0.03)
     p.add_argument("--hybrid-max-explicit", type=float, default=0.05)
-    p.add_argument("--hybrid-workers", type=int, default=-1,
-                   help="-1=auto, 0=off, N=exact persistent district workers (hybrid only).")
+    p.add_argument("--hybrid-workers", "--workers", dest="hybrid_workers", type=int, default=-1,
+                   help="-1=auto, 0=off, N=exact persistent district workers (hybrid only). --workers is an alias.")
     p.add_argument("--hybrid-worker-min-active", type=int, default=1024,
                    help="Use multiprocessing only when at least this many explicit agents are active.")
     p.add_argument("--profile-periodic", action="store_true",
