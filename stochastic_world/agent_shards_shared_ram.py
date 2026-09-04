@@ -1,6 +1,6 @@
 """RAM-first shard backend for --aggressive-parallel.
 
-Workers receive only control metadata.  Fixed pid ownership, eligibility and
+Workers receive only control metadata. Fixed pid ownership, eligibility and
 social candidates are all discovered from shared memory, eliminating the daily
 candidate-pool pickle and pid-shard queue payloads.
 """
@@ -25,6 +25,109 @@ from .multiprocessing_engine import _DeterministicStream, _seed_for, _weighted_a
 
 
 _PHASE_SOCIAL = 0x50C1A1
+_MEMORY_RECONCILE_INTERVAL_DAYS = 7
+
+
+def _memory_scores(memory):
+    if memory is None:
+        return 0.0, 0.0
+    trust, grievance, _familiarity, _decayed_day = memory
+    affinity = max(-100.0, min(100.0, trust - grievance))
+    conflict = max(0.0, grievance - min(0.0, trust))
+    return affinity, conflict
+
+
+def _refresh_worker_social_aggregate(state, memories, day):
+    """Build the action-weight social aggregate from worker-owned memory.
+
+    Main-side Person.memories is intentionally not maintained in aggressive mode,
+    so using snapshot aggregate values there would freeze social action weights.
+    Reconcile lazy decay weekly, matching Person.decay_memories(), then keep the
+    aggregate incremental for the rest of the day's action rounds.
+    """
+    if not memories:
+        state["_known_people"] = 0
+        state["_affinity_sum"] = 0.0
+        state["_max_conflict_target"] = None
+        state["positive_ties"] = 0
+        state["hostile_ties"] = 0
+        state["max_conflict"] = 0.0
+        state["mean_affinity"] = 0.0
+        return
+
+    reconcile = int(day) % _MEMORY_RECONCILE_INTERVAL_DAYS == 0
+    affinity_sum = 0.0
+    positive_ties = 0
+    hostile_ties = 0
+    max_conflict = 0.0
+    max_target = None
+    for target_id in tuple(memories):
+        memory = (
+            planner._materialize_memory(memories, target_id, day)
+            if reconcile
+            else memories.get(target_id)
+        )
+        affinity, conflict = _memory_scores(memory)
+        affinity_sum += affinity
+        positive_ties += int(affinity >= 15.0)
+        hostile_ties += int(conflict >= 20.0)
+        if conflict > max_conflict:
+            max_conflict = conflict
+            max_target = target_id
+
+    known = len(memories)
+    state["_known_people"] = known
+    state["_affinity_sum"] = affinity_sum
+    state["_max_conflict_target"] = max_target
+    state["positive_ties"] = positive_ties
+    state["hostile_ties"] = hostile_ties
+    state["max_conflict"] = max_conflict
+    state["mean_affinity"] = affinity_sum / known if known else 0.0
+
+
+def _recompute_worker_max_conflict(state, memories):
+    max_conflict = 0.0
+    max_target = None
+    for target_id, memory in memories.items():
+        _affinity, conflict = _memory_scores(memory)
+        if conflict > max_conflict:
+            max_conflict = conflict
+            max_target = target_id
+    state["max_conflict"] = max_conflict
+    state["_max_conflict_target"] = max_target
+
+
+def _remember_worker_social(state, memories, social_plan, day):
+    """Apply actor memory and update action-weight aggregates incrementally."""
+    action, target_id, payload, _witness_ids = social_plan
+    if target_id is None or payload is None:
+        return
+
+    before_exists = target_id in memories
+    before = planner._materialize_memory(memories, target_id, day)
+    old_affinity, old_conflict = _memory_scores(before)
+
+    planner._remember_planned_social(memories, social_plan, day)
+    after = memories.get(target_id)
+    if after is None:
+        return
+    new_affinity, new_conflict = _memory_scores(after)
+
+    if not before_exists:
+        state["_known_people"] += 1
+    state["_affinity_sum"] += new_affinity - old_affinity
+    state["positive_ties"] += int(new_affinity >= 15.0) - int(old_affinity >= 15.0)
+    state["hostile_ties"] += int(new_conflict >= 20.0) - int(old_conflict >= 20.0)
+
+    current_max_target = state.get("_max_conflict_target")
+    if new_conflict >= state["max_conflict"]:
+        state["max_conflict"] = new_conflict
+        state["_max_conflict_target"] = target_id
+    elif current_max_target == target_id and new_conflict < old_conflict:
+        _recompute_worker_max_conflict(state, memories)
+
+    known = state["_known_people"]
+    state["mean_affinity"] = state["_affinity_sum"] / known if known else 0.0
 
 
 def _social_plan_ram(state, action, memories, social, master_seed, day, round_index,
@@ -108,6 +211,18 @@ def _plan_row_ram(snapshot, memories, economy, social, master_seed, day,
         "scavenge_food_max": scavenge_food_max,
         "medicine_chance": medicine_chance,
     }
+
+    # Once an actor has worker-owned memories, those are authoritative for
+    # social action weights in aggressive mode. This avoids the stale main-side
+    # aggregate that caused conflict to collapse after relationship bookkeeping
+    # moved out of the main process.
+    if memories:
+        _refresh_worker_social_aggregate(state, memories, day)
+    else:
+        state["_known_people"] = 0
+        state["_affinity_sum"] = 0.0
+        state["_max_conflict_target"] = None
+
     intents = []
     for round_index in range(int(actions_per_day)):
         _, action = _weighted_action(
@@ -125,7 +240,7 @@ def _plan_row_ram(snapshot, memories, economy, social, master_seed, day,
                 state, action, memories, social, master_seed, day, round_index,
                 encounter_sample, max_witnesses, visibility,
             )
-            planner._remember_planned_social(memories, social_plan, day)
+            _remember_worker_social(state, memories, social_plan, day)
             intents.append(("social",) + social_plan)
         elif action == "idle":
             intents.append(None)
