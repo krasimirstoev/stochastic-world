@@ -2,10 +2,10 @@ import argparse
 
 from tqdm import tqdm
 
+from .agent_world import ParallelAgentWorld
 from .geography import DEFAULT_TARGET_NEIGHBORHOOD_SIZE, recommended_location_count
 from .hybrid_world import HybridWorld
 from .life_storage import LifeEventStore, LifeHybridEventStore
-from .life_world import LifeWorld
 from .rng import derive_run_seeds, make_rng
 from .run_statistics import RunStatistics
 
@@ -35,10 +35,15 @@ def parse_args():
     p.add_argument("--hybrid-interest-days", type=int, default=30)
     p.add_argument("--hybrid-target-explicit", type=float, default=0.03)
     p.add_argument("--hybrid-max-explicit", type=float, default=0.05)
-    p.add_argument("--hybrid-workers", "--workers", dest="hybrid_workers", type=int, default=-1,
-                   help="-1=auto, 0=off, N=exact persistent district workers (hybrid only). --workers is an alias.")
+    p.add_argument(
+        "--workers", "--hybrid-workers", dest="hybrid_workers", type=int, default=-1,
+        help=(
+            "Worker processes: agent uses 0 when omitted; hybrid uses auto when omitted. "
+            "0=off, N=exact workers. --hybrid-workers remains a compatibility alias."
+        ),
+    )
     p.add_argument("--hybrid-worker-min-active", type=int, default=1024,
-                   help="Use multiprocessing only when at least this many explicit agents are active.")
+                   help="Use multiprocessing only when at least this many active agents are present.")
     p.add_argument("--profile-periodic", action="store_true",
                    help="Profile hybrid phases and persist timings to performance_timings.")
     p.add_argument("--no-progress", action="store_true")
@@ -65,6 +70,12 @@ def _print_profile_summary(world):
         )
 
 
+def _resolved_worker_arg(args, engine):
+    if engine == "agent" and args.hybrid_workers < 0:
+        return 0
+    return args.hybrid_workers
+
+
 def run_once(args, master_seed, run_seed, run_index, progress, engine):
     _, rng = make_rng(run_seed)
     locations_count = (
@@ -72,6 +83,7 @@ def run_once(args, master_seed, run_seed, run_index, progress, engine):
         if args.locations > 0
         else recommended_location_count(args.population, args.target_neighborhood_size)
     )
+    workers = _resolved_worker_arg(args, engine)
     config = {
         "seed": run_seed,
         "population": args.population,
@@ -83,6 +95,7 @@ def run_once(args, master_seed, run_seed, run_index, progress, engine):
         "locations_count": locations_count,
         "event_mode": args.event_mode,
         "engine": engine,
+        "workers": workers,
         "hybrid_workers": args.hybrid_workers,
         "hybrid_worker_min_active": args.hybrid_worker_min_active,
         "hybrid_target_explicit": args.hybrid_target_explicit,
@@ -91,7 +104,7 @@ def run_once(args, master_seed, run_seed, run_index, progress, engine):
         "hybrid_interest_days": args.hybrid_interest_days,
     }
     store_cls = LifeHybridEventStore if engine == "hybrid" else LifeEventStore
-    world_cls = HybridWorld if engine == "hybrid" else LifeWorld
+    world_cls = HybridWorld if engine == "hybrid" else ParallelAgentWorld
     store = store_cls(args.db, args.log, config, run_index=run_index, master_seed=master_seed)
     world_kwargs = dict(
         visibility=args.visibility,
@@ -107,19 +120,32 @@ def run_once(args, master_seed, run_seed, run_index, progress, engine):
             hybrid_target_explicit=args.hybrid_target_explicit,
             hybrid_max_explicit=args.hybrid_max_explicit,
             profile_periodic=args.profile_periodic,
-            hybrid_workers=args.hybrid_workers,
+            hybrid_workers=workers,
             hybrid_worker_min_active=args.hybrid_worker_min_active,
         )
-    world = world_cls(rng, args.population, args.actions_per_day, store, run_seed, args.locale, **world_kwargs)
-    if engine == "agent":
-        world.engine_mode = "agent"
+    else:
+        world_kwargs.update(
+            agent_workers=workers,
+            agent_worker_min_active=args.hybrid_worker_min_active,
+        )
+
+    world = world_cls(
+        rng,
+        args.population,
+        args.actions_per_day,
+        store,
+        run_seed,
+        args.locale,
+        **world_kwargs,
+    )
 
     if not args.quiet:
+        pool = getattr(world, "district_pool", None)
         worker_text = ""
-        if engine == "hybrid":
+        if pool is not None:
             worker_text = (
-                f" | workers={world.district_pool.worker_count if world.district_pool.enabled else 0}"
-                f" | mp_min_active={world.district_pool.min_active}"
+                f" | workers={pool.worker_count if pool.enabled else 0}"
+                f" | mp_min_active={pool.min_active}"
             )
         tqdm.write(
             f"Run {run_index}/{args.runs} | simulation_id={store.simulation_id} | seed={run_seed} "
@@ -142,6 +168,9 @@ def run_once(args, master_seed, run_seed, run_index, progress, engine):
                     "births": world.demographics.total_births,
                     "arrests": world.total_arrests,
                 }
+                pool = getattr(world, "district_pool", None)
+                if pool is not None and pool.enabled:
+                    postfix["mp"] = pool.worker_count
                 if engine == "hybrid":
                     s = world.last_hybrid_stats
                     postfix.update(
@@ -150,7 +179,6 @@ def run_once(args, master_seed, run_seed, run_index, progress, engine):
                         p0=s["mandatory_agents"],
                         high=s["high_priority_agents"],
                         pending=s["pending_interesting"],
-                        mp=world.district_pool.worker_count if world.district_pool.enabled else 0,
                     )
                 progress.set_postfix(**postfix, refresh=False)
             if world.alive_count == 0:
@@ -192,8 +220,9 @@ def run_once(args, master_seed, run_seed, run_index, progress, engine):
             )
         return collapse
     finally:
-        if engine == "hybrid":
-            world.close_parallel()
+        close_parallel = getattr(world, "close_parallel", None)
+        if close_parallel is not None:
+            close_parallel()
         if not completed:
             try:
                 store.log_fh.flush()
@@ -220,15 +249,13 @@ def main():
     if not args.hybrid_target_explicit <= args.hybrid_max_explicit <= 1:
         raise SystemExit("hybrid-max-explicit must be >= target and <= 1")
     if args.hybrid_workers < -1:
-        raise SystemExit("hybrid-workers must be -1 (auto), 0 (off), or a positive integer")
+        raise SystemExit("workers must be -1 (auto/default), 0 (off), or a positive integer")
     if args.hybrid_worker_min_active < 1:
         raise SystemExit("hybrid-worker-min-active must be >= 1")
 
     engine = resolve_engine(args)
     if args.profile_periodic and engine != "hybrid":
         raise SystemExit("--profile-periodic currently requires --engine hybrid (or auto at population >= 100000)")
-    if engine != "hybrid" and args.hybrid_workers not in (-1, 0):
-        raise SystemExit("--hybrid-workers only applies to the hybrid engine")
 
     master, _ = make_rng(args.seed)
     seeds = derive_run_seeds(master, args.runs)
@@ -237,11 +264,14 @@ def main():
         if args.locations > 0
         else recommended_location_count(args.population, args.target_neighborhood_size)
     )
-    worker_mode = (
-        "auto" if args.hybrid_workers < 0 else
-        "off" if args.hybrid_workers == 0 else
-        str(args.hybrid_workers)
-    )
+    workers = _resolved_worker_arg(args, engine)
+    if engine == "hybrid" and workers < 0:
+        worker_mode = "auto"
+    elif workers == 0:
+        worker_mode = "off"
+    else:
+        worker_mode = str(workers)
+
     print(
         f"Master seed: {master}\n"
         f"Runs: {args.runs}\n"
@@ -250,7 +280,7 @@ def main():
         f"Districts: {resolved_locations} ({'manual' if args.locations else 'auto'})\n"
         f"Engine: {engine}\n"
         f"Demographics: enabled\n"
-        f"Hybrid workers: {worker_mode}\n"
+        f"Workers: {worker_mode}\n"
         f"Statistics log: {'disabled' if args.no_statistics_log else args.statistics_log}\n"
         f"Profiling: {'periodic phases' if args.profile_periodic else 'off'}\n"
     )
@@ -273,6 +303,7 @@ def main():
     finally:
         if progress is not None:
             progress.close()
+
     print(
         f"\nBatch summary\n"
         f"  runs={args.runs}\n"
