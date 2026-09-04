@@ -3,12 +3,16 @@ import os
 
 from tqdm import tqdm
 
+from .aggressive_world import AggressiveParallelAgentWorld
 from .agent_world import ParallelAgentWorld
 from .geography import DEFAULT_TARGET_NEIGHBORHOOD_SIZE, recommended_location_count
 from .hybrid_world import HybridWorld
 from .life_storage import LifeEventStore, LifeHybridEventStore
 from .rng import derive_run_seeds, make_rng
 from .run_statistics import RunStatistics
+
+
+AGGRESSIVE_MIN_ACTIVE = 64
 
 
 def parse_args():
@@ -89,14 +93,20 @@ def _resolved_worker_arg(args, engine):
     return args.hybrid_workers
 
 
+def _agent_min_active(args):
+    if args.aggressive_parallel:
+        return min(args.hybrid_worker_min_active, AGGRESSIVE_MIN_ACTIVE)
+    return args.hybrid_worker_min_active
+
+
 def run_once(args, master_seed, run_seed, run_index, progress, engine):
     _, rng = make_rng(run_seed)
     locations_count = (
-        args.locations
-        if args.locations > 0
+        args.locations if args.locations > 0
         else recommended_location_count(args.population, args.target_neighborhood_size)
     )
     workers = _resolved_worker_arg(args, engine)
+    agent_min_active = _agent_min_active(args)
     config = {
         "seed": run_seed,
         "population": args.population,
@@ -115,13 +125,19 @@ def run_once(args, master_seed, run_seed, run_index, progress, engine):
         "workers": workers,
         "hybrid_workers": args.hybrid_workers,
         "hybrid_worker_min_active": args.hybrid_worker_min_active,
+        "agent_worker_min_active": agent_min_active,
         "hybrid_target_explicit": args.hybrid_target_explicit,
         "hybrid_max_explicit": args.hybrid_max_explicit,
         "hybrid_sample_per_district": args.hybrid_sample_per_district,
         "hybrid_interest_days": args.hybrid_interest_days,
     }
     store_cls = LifeHybridEventStore if engine == "hybrid" else LifeEventStore
-    world_cls = HybridWorld if engine == "hybrid" else ParallelAgentWorld
+    if engine == "hybrid":
+        world_cls = HybridWorld
+    elif args.aggressive_parallel:
+        world_cls = AggressiveParallelAgentWorld
+    else:
+        world_cls = ParallelAgentWorld
     store = store_cls(args.db, args.log, config, run_index=run_index, master_seed=master_seed)
     world_kwargs = dict(
         visibility=args.visibility,
@@ -143,17 +159,11 @@ def run_once(args, master_seed, run_seed, run_index, progress, engine):
     else:
         world_kwargs.update(
             agent_workers=workers,
-            agent_worker_min_active=args.hybrid_worker_min_active,
+            agent_worker_min_active=agent_min_active,
         )
 
     world = world_cls(
-        rng,
-        args.population,
-        args.actions_per_day,
-        store,
-        run_seed,
-        args.locale,
-        **world_kwargs,
+        rng, args.population, args.actions_per_day, store, run_seed, args.locale, **world_kwargs
     )
     world.memory_cap = args.memory_cap
     world.encounter_sample = args.encounter_sample
@@ -171,7 +181,11 @@ def run_once(args, master_seed, run_seed, run_index, progress, engine):
                 f" | mp_min_active={pool.min_active}"
             )
         if args.aggressive_parallel:
-            worker_text += " | aggressive=on"
+            shard_pool = getattr(world, "shard_pool", None)
+            shard_text = ""
+            if shard_pool is not None:
+                shard_text = f" | shard_min_active={shard_pool.min_active}"
+            worker_text += f" | aggressive=on{shard_text}"
         tqdm.write(
             f"Run {run_index}/{args.runs} | simulation_id={store.simulation_id} | seed={run_seed} "
             f"| districts={len(world.locations)} | engine={engine} | event_mode={store.event_mode}{worker_text}"
@@ -199,10 +213,8 @@ def run_once(args, master_seed, run_seed, run_index, progress, engine):
                 if engine == "hybrid":
                     s = world.last_hybrid_stats
                     postfix.update(
-                        explicit=s["explicit_agents"],
-                        aggregated=s["aggregated_agents"],
-                        p0=s["mandatory_agents"],
-                        high=s["high_priority_agents"],
+                        explicit=s["explicit_agents"], aggregated=s["aggregated_agents"],
+                        p0=s["mandatory_agents"], high=s["high_priority_agents"],
                         pending=s["pending_interesting"],
                     )
                 progress.set_postfix(**postfix, refresh=False)
@@ -221,14 +233,8 @@ def run_once(args, master_seed, run_seed, run_index, progress, engine):
         statistics_path = None if args.no_statistics_log else args.statistics_log
         reporter = RunStatistics(statistics_path)
         report = reporter.build(
-            world,
-            store,
-            master_seed=master_seed,
-            run_seed=run_seed,
-            run_index=run_index,
-            last_day=last,
-            collapse_day=collapse,
-            config=config,
+            world, store, master_seed=master_seed, run_seed=run_seed,
+            run_index=run_index, last_day=last, collapse_day=collapse, config=config,
         )
         reporter.write(report)
         if not args.quiet:
@@ -293,8 +299,7 @@ def main():
     master, _ = make_rng(args.seed)
     seeds = derive_run_seeds(master, args.runs)
     resolved_locations = (
-        args.locations
-        if args.locations > 0
+        args.locations if args.locations > 0
         else recommended_location_count(args.population, args.target_neighborhood_size)
     )
     workers = _resolved_worker_arg(args, engine)
@@ -325,11 +330,8 @@ def main():
     progress = None
     if not args.no_progress:
         progress = tqdm(
-            total=args.runs * args.period,
-            desc="Simulation",
-            unit="day",
-            dynamic_ncols=True,
-            smoothing=0.1,
+            total=args.runs * args.period, desc="Simulation", unit="day",
+            dynamic_ncols=True, smoothing=0.1,
         )
     collapses = []
     try:
