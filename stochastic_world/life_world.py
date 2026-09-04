@@ -117,7 +117,7 @@ class LifeWorld(World):
         person.food -= 1
         person.energy = max(0, person.energy - (2 if person.is_dependent else 3))
         person.shelter = max(0, person.shelter - self.rng.randint(0, 2) - location.shelter_decay_bonus)
-        person.decay_memories()
+        person.decay_memories(self.current_day)
         if person.is_adult:
             self.politics.update_attitudes(person, rates.get(person.location_id, 0.0))
         damage, causes = 0, []

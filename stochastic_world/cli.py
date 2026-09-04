@@ -35,6 +35,8 @@ def parse_args():
                    help="Force the day-1 government; auto preserves election-driven startup.")
     p.add_argument("--memory-cap", type=int, default=64,
                    help="Maximum detailed social memories per person; 0 means unlimited (default: 64).")
+    p.add_argument("--encounter-sample", type=int, default=16,
+                   help="Candidate people sampled for social target selection (default: 16).")
     p.add_argument("--hybrid-sample-per-district", type=int, default=256)
     p.add_argument("--hybrid-interest-days", type=int, default=30)
     p.add_argument("--hybrid-target-explicit", type=float, default=0.03)
@@ -101,6 +103,7 @@ def run_once(args, master_seed, run_seed, run_index, progress, engine):
         "engine": engine,
         "initial_government": args.initial_government,
         "memory_cap": args.memory_cap,
+        "encounter_sample": args.encounter_sample,
         "workers": workers,
         "hybrid_workers": args.hybrid_workers,
         "hybrid_worker_min_active": args.hybrid_worker_min_active,
@@ -145,6 +148,7 @@ def run_once(args, master_seed, run_seed, run_index, progress, engine):
         **world_kwargs,
     )
     world.memory_cap = args.memory_cap
+    world.encounter_sample = args.encounter_sample
     for person in world.people:
         person.memory_cap = args.memory_cap
     if args.initial_government != "auto":
@@ -255,6 +259,8 @@ def main():
         raise SystemExit("police-per-1000 must be >= 0")
     if args.memory_cap < 0:
         raise SystemExit("memory-cap must be >= 0")
+    if args.encounter_sample < 1:
+        raise SystemExit("encounter-sample must be >= 1")
     if args.hybrid_sample_per_district < 16 or args.hybrid_interest_days < 1:
         raise SystemExit("invalid hybrid settings")
     if not 0 < args.hybrid_target_explicit <= 1:
@@ -295,6 +301,7 @@ def main():
         f"Demographics: enabled\n"
         f"Initial government: {args.initial_government}\n"
         f"Memory cap: {'unlimited' if args.memory_cap == 0 else args.memory_cap}\n"
+        f"Encounter sample: {args.encounter_sample}\n"
         f"Workers: {worker_mode}\n"
         f"Statistics log: {'disabled' if args.no_statistics_log else args.statistics_log}\n"
         f"Profiling: {'periodic phases' if args.profile_periodic else 'off'}\n"

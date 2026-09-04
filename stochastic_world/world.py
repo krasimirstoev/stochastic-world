@@ -12,7 +12,7 @@ from .professions import MOBILITY_INTERVAL_DAYS, choose_profession, mobility_dec
 from .transport import TransportSystem
 
 
-LOCAL_ENCOUNTER_SAMPLE = 24
+LOCAL_ENCOUNTER_SAMPLE = 16
 
 
 class World:
@@ -28,7 +28,7 @@ class World:
         self.goods_market=GoodsMarket(self.locations,{loc.id:self.population_index.population(loc.id) for loc in self.locations})
         self.police=PoliceSystem(self.locations,self.population_index,self.rng,police_per_1000)
         self.transport=TransportSystem(self.locations,self.goods_market,self.labor_market,self.rng)
-        self.visibility=max(0.0,min(1.0,visibility));self.max_witnesses=max(0,max_witnesses)
+        self.visibility=max(0.0,min(1.0,visibility));self.max_witnesses=max(0,max_witnesses);self.encounter_sample=LOCAL_ENCOUNTER_SAMPLE
         self.current_day=0;self.sequence=0;self.total_moves=0;self.total_helps=0;self.total_thefts=0;self.total_attacks=0;self.total_observations=0;self.total_deaths=0;self.total_mobility_changes=0;self.total_arrests=0
         self.daily_crimes=defaultdict(int);self.crime_history={loc.id:deque(maxlen=30) for loc in self.locations}
         for location in self.locations:self.store.register_location(location)
@@ -49,7 +49,9 @@ class World:
         return self._living_cache
     def people_in_location(self,location_id):return [self.people[pid] for pid in self.population_index.ids(location_id) if self.people[pid].alive]
     def location_of(self,person):return self.locations[person.location_id]
-    def local_candidates(self,person,limit=LOCAL_ENCOUNTER_SAMPLE,exclude=()):return self.population_index.sample_people(person.location_id,self.rng,limit,tuple(exclude)+(person.id,))
+    def local_candidates(self,person,limit=None,exclude=()):
+        if limit is None:limit=self.encounter_sample
+        return self.population_index.sample_people(person.location_id,self.rng,limit,tuple(exclude)+(person.id,))
     def local_crime_rate(self,location_id):
         population=max(1,self.population_index.population(location_id));history=self.crime_history[location_id]
         return sum(history)/(population*len(history)) if history else 0.0
@@ -61,7 +63,7 @@ class World:
         if not candidates:return None
         weights=[]
         for target in candidates:
-            memory=actor.memories.get(target.id)
+            memory=actor.memory_by_id(target.id,self.current_day)
             if mode=="help":
                 value=1 if memory is None else 1+max(0,memory.affinity)/10+memory.familiarity/20
             elif mode=="attack":
@@ -73,7 +75,7 @@ class World:
         return self.rng.choices(candidates,weights=weights,k=1)[0]
 
     def relation_snapshot(self,observer,other):
-        m=observer.memory_of(other);return {"trust":round(m.trust,3),"grievance":round(m.grievance,3),"affinity":round(m.affinity,3),"conflict":round(m.conflict_score,3),"familiarity":m.familiarity,"observed_help":m.observed_help,"observed_theft":m.observed_theft,"observed_attack":m.observed_attack}
+        m=observer.memory_of(other,self.current_day);return {"trust":round(m.trust,3),"grievance":round(m.grievance,3),"affinity":round(m.affinity,3),"conflict":round(m.conflict_score,3),"familiarity":m.familiarity,"observed_help":m.observed_help,"observed_theft":m.observed_theft,"observed_attack":m.observed_attack}
 
     def remember_interaction(self,actor,target,action,magnitude=1.0):
         actor_before=self.relation_snapshot(actor,target);target_before=self.relation_snapshot(target,actor);actor.remember(target,self.current_day,action,"actor",magnitude);target.remember(actor,self.current_day,action,"target",magnitude);actor_after=self.relation_snapshot(actor,target);target_after=self.relation_snapshot(target,actor)
@@ -227,7 +229,7 @@ class World:
             if person.employer_id is None:person.unemployment_days+=1;person.lifetime_unemployment_days+=1
             else:person.unemployment_days=0
             if person.unemployment_days>30:person.shift_ideology(-0.0004)
-            person.food-=1;person.energy=max(0,person.energy-3);person.shelter=max(0,person.shelter-self.rng.randint(0,2)-location.shelter_decay_bonus);person.decay_memories();self.politics.update_attitudes(person,rates.get(person.location_id,0.0))
+            person.food-=1;person.energy=max(0,person.energy-3);person.shelter=max(0,person.shelter-self.rng.randint(0,2)-location.shelter_decay_bonus);person.decay_memories(self.current_day);self.politics.update_attitudes(person,rates.get(person.location_id,0.0))
             damage,causes=0,[]
             if person.food<0:person.food=0;damage+=self.rng.randint(4,10);causes.append("starvation")
             if person.energy==0:damage+=self.rng.randint(2,6);causes.append("exhaustion")

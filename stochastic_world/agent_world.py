@@ -184,7 +184,7 @@ class ParallelAgentWorld(LifeWorld):
         person.lifetime_unemployment_days += lifetime_unemployment_increment
         if ideology_shift:
             person.shift_ideology(ideology_shift)
-        person.decay_memories()
+        person.decay_memories(self.current_day)
         if damage:
             self.store.event(
                 self.current_day,
