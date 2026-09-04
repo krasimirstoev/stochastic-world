@@ -24,8 +24,10 @@ _RESOURCE_TO_CODE = {name: index for index, name in enumerate(_RESOURCES)}
 _INPUT = struct.Struct("<iiiiiidBBiiddidB")
 # food, medicine, energy, health, shelter, money
 _STATE = struct.Struct("<iiiiid")
-# kind, action, target, resource, amount/damage, extra/energy_cost, witness_count
-_INTENT = struct.Struct("<BBiBddB")
+# kind, action, target, resource, value0..value4, witness_count
+# Kinds: 0 none, 1 generic shared, 2 social, 3 prepared move,
+# 4 prepared work, 5 prepared purchase.
+_INTENT = struct.Struct("<BBiBdddddB")
 
 
 class SharedAgentBuffers:
@@ -121,17 +123,53 @@ class SharedAgentBuffers:
         slot = int(pid) * self.actions_per_day + int(round_index)
         return slot * self.intent_record_size
 
+    def _pack_intent(self, offset, kind, action_code=0, target=-1, resource_code=0, values=(), witness_count=0):
+        padded = tuple(float(v) for v in values[:5]) + (0.0,) * max(0, 5 - len(values))
+        _INTENT.pack_into(
+            self._intent.buf,
+            offset,
+            int(kind), int(action_code), int(target), int(resource_code),
+            padded[0], padded[1], padded[2], padded[3], padded[4], int(witness_count),
+        )
+
     def write_intent(self, pid, round_index, plan):
         offset = self._intent_offset(pid, round_index)
         if plan is None:
-            _INTENT.pack_into(self._intent.buf, offset, 0, 0, -1, 0, 0.0, 0.0, 0)
+            self._pack_intent(offset, 0)
             return
 
         kind = plan[0]
         if kind == "shared":
             action = plan[1]
-            _INTENT.pack_into(
-                self._intent.buf, offset, 1, _ACTION_TO_CODE.get(action, 0), -1, 0, 0.0, 0.0, 0
+            self._pack_intent(offset, 1, _ACTION_TO_CODE.get(action, 0))
+            return
+        if kind == "move_prepared":
+            _, destination_id, energy_cost = plan
+            self._pack_intent(offset, 3, _ACTION_TO_CODE["move"], destination_id, values=(energy_cost,))
+            return
+        if kind == "work_prepared":
+            (
+                _, employer_id, gross, energy_cost, output_good,
+                produced, service_revenue, career_delta,
+            ) = plan
+            self._pack_intent(
+                offset,
+                4,
+                _ACTION_TO_CODE["work"],
+                employer_id,
+                _RESOURCE_TO_CODE.get(output_good, 0),
+                (gross, energy_cost, produced, service_revenue, career_delta),
+            )
+            return
+        if kind == "buy_prepared":
+            _, resource, requested = plan
+            self._pack_intent(
+                offset,
+                5,
+                _ACTION_TO_CODE["buy_supplies"],
+                -1,
+                _RESOURCE_TO_CODE.get(resource, 0),
+                (requested,),
             )
             return
 
@@ -149,15 +187,13 @@ class SharedAgentBuffers:
             amount = float(damage)
             extra = float(energy_cost)
         witnesses = tuple(witness_ids or ())[: self.max_witnesses]
-        _INTENT.pack_into(
-            self._intent.buf,
+        self._pack_intent(
             offset,
             2,
             _ACTION_TO_CODE.get(action, 0),
             -1 if target_id is None else int(target_id),
             resource_code,
-            amount,
-            extra,
+            (amount, extra),
             len(witnesses),
         )
         witness_offset = offset + _INTENT.size
@@ -166,14 +202,27 @@ class SharedAgentBuffers:
 
     def read_intent(self, pid, round_index):
         offset = self._intent_offset(pid, round_index)
-        kind, action_code, target_id, resource_code, amount, extra, witness_count = _INTENT.unpack_from(
-            self._intent.buf, offset
-        )
+        (
+            kind, action_code, target_id, resource_code,
+            value0, value1, value2, value3, value4, witness_count,
+        ) = _INTENT.unpack_from(self._intent.buf, offset)
         if kind == 0 or action_code <= 0 or action_code >= len(_ACTIONS):
             return None
         action = _ACTIONS[action_code]
         if kind == 1:
             return ("shared", action)
+        if kind == 3:
+            return ("move_prepared", int(target_id), int(value0))
+        if kind == 4:
+            resource = _RESOURCES[resource_code] if resource_code < len(_RESOURCES) else None
+            return (
+                "work_prepared", int(target_id), int(value0), int(value1), resource,
+                float(value2), float(value3), float(value4),
+            )
+        if kind == 5:
+            resource = _RESOURCES[resource_code] if resource_code < len(_RESOURCES) else None
+            return ("buy_prepared", resource, int(value0))
+
         witnesses = []
         witness_offset = offset + _INTENT.size
         for index in range(min(int(witness_count), self.max_witnesses)):
@@ -182,9 +231,9 @@ class SharedAgentBuffers:
         target = None if target_id < 0 else target_id
         if action in ("help", "steal"):
             resource = _RESOURCES[resource_code] if resource_code < len(_RESOURCES) else None
-            payload = (resource, amount)
+            payload = (resource, value0)
         else:
-            payload = (int(amount), int(extra))
+            payload = (int(value0), int(value1))
         return ("social", action, target, payload, tuple(witnesses))
 
     def write_result(self, pid, final_state, intents):
@@ -194,10 +243,11 @@ class SharedAgentBuffers:
             self.write_intent(pid, round_index, plan)
 
     def close(self, *, unlink=False):
-        for segment in (self._input, self._state, self._intent):
+        segments = (self._input, self._state, self._intent)
+        for segment in segments:
             segment.close()
         if unlink and self._owner:
-            for segment in (self._input, self._state, self._intent):
+            for segment in segments:
                 try:
                     segment.unlink()
                 except FileNotFoundError:
