@@ -25,6 +25,28 @@ class ParallelAgentWorld(LifeWorld):
             min_active=agent_worker_min_active,
         )
 
+    def remember_interaction(self, actor, target, action, magnitude=1.0):
+        if self.store.event_mode == "full":
+            return super().remember_interaction(actor, target, action, magnitude)
+        actor.remember(target, self.current_day, action, "actor", magnitude)
+        target.remember(actor, self.current_day, action, "target", magnitude)
+        self.spread_reputation(actor, target, action, magnitude)
+
+    def spread_reputation(self, actor, target, action, magnitude):
+        if self.store.event_mode == "full":
+            return super().spread_reputation(actor, target, action, magnitude)
+        if not self.max_witnesses or self.rng.random() > self.visibility:
+            return
+        witnesses = self.population_index.sample_people(
+            actor.location_id,
+            self.rng,
+            self.max_witnesses,
+            exclude=(actor.id, target.id),
+        )
+        for witness in witnesses:
+            witness.observe(actor, self.current_day, action, magnitude)
+            self.total_observations += 1
+
     def _action_snapshot(self, person):
         memory = person.aggregate_memory()
         location = self.location_of(person)
