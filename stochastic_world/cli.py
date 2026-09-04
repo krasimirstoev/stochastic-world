@@ -7,6 +7,7 @@ from .hybrid_world import HybridWorld
 from .life_storage import LifeEventStore, LifeHybridEventStore
 from .life_world import LifeWorld
 from .rng import derive_run_seeds, make_rng
+from .run_statistics import RunStatistics
 
 
 def parse_args():
@@ -18,6 +19,10 @@ def parse_args():
     p.add_argument("--runs", type=int, default=1)
     p.add_argument("--db", default="simulation.sqlite")
     p.add_argument("--log", default="simulation.log")
+    p.add_argument("--statistics-log", default="statistics.log",
+                   help="Append detailed end-of-run reports to this file (default: statistics.log).")
+    p.add_argument("--no-statistics-log", action="store_true",
+                   help="Disable the detailed statistics log.")
     p.add_argument("--locale", default="en_US")
     p.add_argument("--visibility", type=float, default=.65)
     p.add_argument("--max-witnesses", type=int, default=3)
@@ -30,6 +35,10 @@ def parse_args():
     p.add_argument("--hybrid-interest-days", type=int, default=30)
     p.add_argument("--hybrid-target-explicit", type=float, default=0.03)
     p.add_argument("--hybrid-max-explicit", type=float, default=0.05)
+    p.add_argument("--hybrid-workers", type=int, default=-1,
+                   help="-1=auto, 0=off, N=exact persistent district workers (hybrid only).")
+    p.add_argument("--hybrid-worker-min-active", type=int, default=1024,
+                   help="Use multiprocessing only when at least this many explicit agents are active.")
     p.add_argument("--profile-periodic", action="store_true",
                    help="Profile hybrid phases and persist timings to performance_timings.")
     p.add_argument("--no-progress", action="store_true")
@@ -50,7 +59,7 @@ def _print_profile_summary(world):
     tqdm.write("  performance profile (wall clock):")
     for row in rows:
         tqdm.write(
-            f"    {row['phase']:<20} calls={row['calls']:>5} "
+            f"    {row['phase']:<24} calls={row['calls']:>5} "
             f"total={row['total']:>8.3f}s avg={row['avg']:>8.4f}s "
             f"p95={row['p95']:>8.4f}s max={row['max']:>8.4f}s"
         )
@@ -58,56 +67,138 @@ def _print_profile_summary(world):
 
 def run_once(args, master_seed, run_seed, run_index, progress, engine):
     _, rng = make_rng(run_seed)
-    locations_count = args.locations if args.locations > 0 else recommended_location_count(args.population, args.target_neighborhood_size)
-    config = {"seed": run_seed, "population": args.population, "actions_per_day": args.actions_per_day,
-              "period": args.period, "faker_locale": args.locale, "visibility": args.visibility,
-              "max_witnesses": args.max_witnesses, "locations_count": locations_count,
-              "event_mode": args.event_mode}
+    locations_count = (
+        args.locations
+        if args.locations > 0
+        else recommended_location_count(args.population, args.target_neighborhood_size)
+    )
+    config = {
+        "seed": run_seed,
+        "population": args.population,
+        "actions_per_day": args.actions_per_day,
+        "period": args.period,
+        "faker_locale": args.locale,
+        "visibility": args.visibility,
+        "max_witnesses": args.max_witnesses,
+        "locations_count": locations_count,
+        "event_mode": args.event_mode,
+        "engine": engine,
+        "hybrid_workers": args.hybrid_workers,
+        "hybrid_worker_min_active": args.hybrid_worker_min_active,
+        "hybrid_target_explicit": args.hybrid_target_explicit,
+        "hybrid_max_explicit": args.hybrid_max_explicit,
+        "hybrid_sample_per_district": args.hybrid_sample_per_district,
+        "hybrid_interest_days": args.hybrid_interest_days,
+    }
     store_cls = LifeHybridEventStore if engine == "hybrid" else LifeEventStore
     world_cls = HybridWorld if engine == "hybrid" else LifeWorld
     store = store_cls(args.db, args.log, config, run_index=run_index, master_seed=master_seed)
-    world_kwargs = dict(visibility=args.visibility, max_witnesses=args.max_witnesses,
-                        locations_count=locations_count, target_neighborhood_size=args.target_neighborhood_size,
-                        police_per_1000=args.police_per_1000)
+    world_kwargs = dict(
+        visibility=args.visibility,
+        max_witnesses=args.max_witnesses,
+        locations_count=locations_count,
+        target_neighborhood_size=args.target_neighborhood_size,
+        police_per_1000=args.police_per_1000,
+    )
     if engine == "hybrid":
-        world_kwargs.update(hybrid_sample_per_district=args.hybrid_sample_per_district,
-                            hybrid_interest_days=args.hybrid_interest_days,
-                            hybrid_target_explicit=args.hybrid_target_explicit,
-                            hybrid_max_explicit=args.hybrid_max_explicit,
-                            profile_periodic=args.profile_periodic)
+        world_kwargs.update(
+            hybrid_sample_per_district=args.hybrid_sample_per_district,
+            hybrid_interest_days=args.hybrid_interest_days,
+            hybrid_target_explicit=args.hybrid_target_explicit,
+            hybrid_max_explicit=args.hybrid_max_explicit,
+            profile_periodic=args.profile_periodic,
+            hybrid_workers=args.hybrid_workers,
+            hybrid_worker_min_active=args.hybrid_worker_min_active,
+        )
     world = world_cls(rng, args.population, args.actions_per_day, store, run_seed, args.locale, **world_kwargs)
     if engine == "agent":
         world.engine_mode = "agent"
+
     if not args.quiet:
-        tqdm.write(f"Run {run_index}/{args.runs} | simulation_id={store.simulation_id} | seed={run_seed} | districts={len(world.locations)} | engine={engine} | event_mode={store.event_mode}")
-    collapse = None; last = 0
-    for day in range(1, args.period + 1):
-        last = day; world.run_day(day)
-        if progress is not None:
-            progress.update(1)
-            postfix = {"run": f"{run_index}/{args.runs}", "day": f"{day}/{args.period}",
-                       "alive": world.alive_count, "births": world.demographics.total_births,
-                       "arrests": world.total_arrests}
-            if engine == "hybrid":
-                s = world.last_hybrid_stats
-                postfix.update(explicit=s["explicit_agents"], aggregated=s["aggregated_agents"],
-                               p0=s["mandatory_agents"], high=s["high_priority_agents"], pending=s["pending_interesting"])
-            progress.set_postfix(**postfix, refresh=False)
-        if world.alive_count == 0:
-            collapse = day; break
-    if progress is not None and last < args.period:
-        progress.update(args.period - last)
-    if engine == "hybrid" and args.profile_periodic:
-        world.profiler.flush(store)
+        worker_text = ""
+        if engine == "hybrid":
+            worker_text = (
+                f" | workers={world.district_pool.worker_count if world.district_pool.enabled else 0}"
+                f" | mp_min_active={world.district_pool.min_active}"
+            )
+        tqdm.write(
+            f"Run {run_index}/{args.runs} | simulation_id={store.simulation_id} | seed={run_seed} "
+            f"| districts={len(world.locations)} | engine={engine} | event_mode={store.event_mode}{worker_text}"
+        )
+
+    collapse = None
+    last = 0
+    completed = False
+    try:
+        for day in range(1, args.period + 1):
+            last = day
+            world.run_day(day)
+            if progress is not None:
+                progress.update(1)
+                postfix = {
+                    "run": f"{run_index}/{args.runs}",
+                    "day": f"{day}/{args.period}",
+                    "alive": world.alive_count,
+                    "births": world.demographics.total_births,
+                    "arrests": world.total_arrests,
+                }
+                if engine == "hybrid":
+                    s = world.last_hybrid_stats
+                    postfix.update(
+                        explicit=s["explicit_agents"],
+                        aggregated=s["aggregated_agents"],
+                        p0=s["mandatory_agents"],
+                        high=s["high_priority_agents"],
+                        pending=s["pending_interesting"],
+                        mp=world.district_pool.worker_count if world.district_pool.enabled else 0,
+                    )
+                progress.set_postfix(**postfix, refresh=False)
+            if world.alive_count == 0:
+                collapse = day
+                break
+
+        if progress is not None and last < args.period:
+            progress.update(args.period - last)
+
+        if engine == "hybrid" and args.profile_periodic:
+            world.profiler.flush(store)
+            if not args.quiet:
+                _print_profile_summary(world)
+
+        statistics_path = None if args.no_statistics_log else args.statistics_log
+        reporter = RunStatistics(statistics_path)
+        report = reporter.build(
+            world,
+            store,
+            master_seed=master_seed,
+            run_seed=run_seed,
+            run_index=run_index,
+            last_day=last,
+            collapse_day=collapse,
+            config=config,
+        )
+        reporter.write(report)
         if not args.quiet:
-            _print_profile_summary(world)
-    store.finish(collapse)
-    if not args.quiet:
-        tqdm.write(f"  finished day={last} alive={world.alive_count} births={world.demographics.total_births} "
-                   f"natural_deaths={world.demographics.total_natural_deaths} government={world.politics.government.name} "
-                   f"elections={world.politics.election_number} deaths={world.total_deaths} arrests={world.total_arrests} "
-                   f"shipments={world.transport.shipments} collapse_day={collapse}")
-    return collapse
+            tqdm.write(RunStatistics.cli_summary(world, statistics_path))
+
+        store.finish(collapse)
+        completed = True
+        if not args.quiet:
+            tqdm.write(
+                f"  finished day={last} alive={world.alive_count} births={world.demographics.total_births} "
+                f"natural_deaths={world.demographics.total_natural_deaths} government={world.politics.government.name} "
+                f"elections={world.politics.election_number} deaths={world.total_deaths} arrests={world.total_arrests} "
+                f"shipments={world.transport.shipments} collapse_day={collapse}"
+            )
+        return collapse
+    finally:
+        if engine == "hybrid":
+            world.close_parallel()
+        if not completed:
+            try:
+                store.log_fh.flush()
+            except Exception:
+                pass
 
 
 def main():
@@ -128,15 +219,51 @@ def main():
         raise SystemExit("hybrid-target-explicit must be in (0, 1]")
     if not args.hybrid_target_explicit <= args.hybrid_max_explicit <= 1:
         raise SystemExit("hybrid-max-explicit must be >= target and <= 1")
+    if args.hybrid_workers < -1:
+        raise SystemExit("hybrid-workers must be -1 (auto), 0 (off), or a positive integer")
+    if args.hybrid_worker_min_active < 1:
+        raise SystemExit("hybrid-worker-min-active must be >= 1")
+
     engine = resolve_engine(args)
     if args.profile_periodic and engine != "hybrid":
         raise SystemExit("--profile-periodic currently requires --engine hybrid (or auto at population >= 100000)")
-    master, _ = make_rng(args.seed); seeds = derive_run_seeds(master, args.runs)
-    resolved_locations = args.locations if args.locations > 0 else recommended_location_count(args.population, args.target_neighborhood_size)
-    print(f"Master seed: {master}\nRuns: {args.runs}\nPopulation: {args.population:,}\nActions/day: {args.actions_per_day}\nDistricts: {resolved_locations} ({'manual' if args.locations else 'auto'})\nEngine: {engine}\nDemographics: enabled\nProfiling: {'periodic phases' if args.profile_periodic else 'off'}\n")
+    if engine != "hybrid" and args.hybrid_workers not in (-1, 0):
+        raise SystemExit("--hybrid-workers only applies to the hybrid engine")
+
+    master, _ = make_rng(args.seed)
+    seeds = derive_run_seeds(master, args.runs)
+    resolved_locations = (
+        args.locations
+        if args.locations > 0
+        else recommended_location_count(args.population, args.target_neighborhood_size)
+    )
+    worker_mode = (
+        "auto" if args.hybrid_workers < 0 else
+        "off" if args.hybrid_workers == 0 else
+        str(args.hybrid_workers)
+    )
+    print(
+        f"Master seed: {master}\n"
+        f"Runs: {args.runs}\n"
+        f"Population: {args.population:,}\n"
+        f"Actions/day: {args.actions_per_day}\n"
+        f"Districts: {resolved_locations} ({'manual' if args.locations else 'auto'})\n"
+        f"Engine: {engine}\n"
+        f"Demographics: enabled\n"
+        f"Hybrid workers: {worker_mode}\n"
+        f"Statistics log: {'disabled' if args.no_statistics_log else args.statistics_log}\n"
+        f"Profiling: {'periodic phases' if args.profile_periodic else 'off'}\n"
+    )
+
     progress = None
     if not args.no_progress:
-        progress = tqdm(total=args.runs * args.period, desc="Simulation", unit="day", dynamic_ncols=True, smoothing=0.1)
+        progress = tqdm(
+            total=args.runs * args.period,
+            desc="Simulation",
+            unit="day",
+            dynamic_ncols=True,
+            smoothing=0.1,
+        )
     collapses = []
     try:
         for i, seed in enumerate(seeds, 1):
@@ -146,7 +273,12 @@ def main():
     finally:
         if progress is not None:
             progress.close()
-    print(f"\nBatch summary\n  runs={args.runs}\n  collapsed={len(collapses)}\n  collapse_rate={len(collapses)/args.runs:.2%}")
+    print(
+        f"\nBatch summary\n"
+        f"  runs={args.runs}\n"
+        f"  collapsed={len(collapses)}\n"
+        f"  collapse_rate={len(collapses)/args.runs:.2%}"
+    )
 
 
 if __name__ == "__main__":
