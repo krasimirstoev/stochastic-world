@@ -33,10 +33,16 @@ class AggressiveParallelAgentWorld(ParallelAgentWorld):
         )
         self._aggressive_seconds = defaultdict(float)
         self._aggressive_calls = defaultdict(int)
+        self._intent_seconds = defaultdict(float)
+        self._intent_calls = defaultdict(int)
 
     def _record_phase(self, phase, started):
         self._aggressive_seconds[phase] += perf_counter() - started
         self._aggressive_calls[phase] += 1
+
+    def _record_intent(self, action, started):
+        self._intent_seconds[action] += perf_counter() - started
+        self._intent_calls[action] += 1
 
     def _shard_row(self, person):
         memories = tuple(
@@ -133,13 +139,17 @@ class AggressiveParallelAgentWorld(ParallelAgentWorld):
                 kind = plan[0]
                 if kind == "social":
                     _, action, target_id, payload, witness_ids = plan
+                    intent_started = perf_counter()
                     self._apply_prepared_social(
                         person,
                         (pid, action, target_id, payload, witness_ids),
                     )
+                    self._record_intent(action, intent_started)
                 else:
                     _, action = plan
+                    intent_started = perf_counter()
                     self._execute_shared_intent(person, action)
+                    self._record_intent(action, intent_started)
         self._record_phase("apply_intents", started)
         self._record_phase("actions_total", total_started)
 
@@ -154,6 +164,17 @@ class AggressiveParallelAgentWorld(ParallelAgentWorld):
             rows.append((phase, calls, total, total / calls if calls else 0.0))
         return rows
 
+    def aggressive_intent_summary(self):
+        rows = []
+        for action, total in sorted(
+            self._intent_seconds.items(),
+            key=lambda item: item[1],
+            reverse=True,
+        ):
+            calls = self._intent_calls[action]
+            rows.append((action, calls, total, total / calls if calls else 0.0))
+        return rows
+
     def close_parallel(self):
         if self._aggressive_seconds:
             print("  aggressive phase profile (wall clock):")
@@ -162,6 +183,13 @@ class AggressiveParallelAgentWorld(ParallelAgentWorld):
                     f"    {phase:<20} calls={calls:>5} "
                     f"total={total:>9.3f}s avg={avg:>8.4f}s"
                 )
+            if self._intent_seconds:
+                print("  aggressive intent profile (main-process wall clock):")
+                for action, calls, total, avg in self.aggressive_intent_summary():
+                    print(
+                        f"    {action:<20} calls={calls:>7} "
+                        f"total={total:>9.3f}s avg={avg:>10.6f}s"
+                    )
             shard = self.shard_pool.summary()
             if shard.get("started"):
                 print(
