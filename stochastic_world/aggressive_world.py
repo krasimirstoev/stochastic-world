@@ -1,14 +1,15 @@
 from collections import defaultdict
 from time import perf_counter
 
-from .agent_shards import PersistentDayShardPool
+from .aggressive_shared import SharedAgentBuffers
+from .agent_shards_shared import SharedPersistentDayShardPool
 from .agent_world import ParallelAgentWorld
 from .population_index import permutation_ids
 from .professions import PROFESSIONS
 
 
 class AggressiveParallelAgentWorld(ParallelAgentWorld):
-    """Opt-in throughput-first agent engine with persistent day shards."""
+    """Opt-in throughput-first agent engine backed by shared-memory day shards."""
 
     def __init__(self, *args, agent_workers=0, agent_worker_min_active=64, **kwargs):
         super().__init__(
@@ -19,8 +20,16 @@ class AggressiveParallelAgentWorld(ParallelAgentWorld):
         )
         seed = args[4] if len(args) > 4 else kwargs.get("population_seed", 0)
         self.aggressive_parallel = True
-        self.shard_pool = PersistentDayShardPool(
+        initial_population = max(1, len(self.people))
+        shared_capacity = max(initial_population * 2, initial_population + 65_536)
+        self.shared_buffers = SharedAgentBuffers(
+            shared_capacity,
+            self.actions_per_day,
+            self.max_witnesses,
+        )
+        self.shard_pool = SharedPersistentDayShardPool(
             seed,
+            self.shared_buffers,
             workers=agent_workers,
             min_active=agent_worker_min_active,
         )
@@ -38,8 +47,10 @@ class AggressiveParallelAgentWorld(ParallelAgentWorld):
         self._intent_seconds[action] += perf_counter() - started
         self._intent_calls[action] += 1
 
-    def _shard_row(self, person):
-        return self._action_snapshot(person)
+    def _ensure_shared_capacity(self):
+        if len(self.people) <= self.shared_buffers.population:
+            return True
+        return False
 
     @staticmethod
     def _apply_local_state(person, final_state):
@@ -257,7 +268,10 @@ class AggressiveParallelAgentWorld(ParallelAgentWorld):
                 self.total_observations += 1
 
     def _run_parallel_actions(self, day):
-        if not self.shard_pool.should_parallelize(self.alive_count):
+        if (
+            not self.shard_pool.should_parallelize(self.alive_count)
+            or not self._ensure_shared_capacity()
+        ):
             started = perf_counter()
             result = super()._run_parallel_actions(day)
             self._record_phase("fallback_actions", started)
@@ -279,17 +293,18 @@ class AggressiveParallelAgentWorld(ParallelAgentWorld):
             return
 
         started = perf_counter()
-        rows = [self._shard_row(self.people[pid]) for pid in eligible_order]
-        self._record_phase("shard_rows", started)
+        for pid in eligible_order:
+            self.shared_buffers.write_snapshot(self._action_snapshot(self.people[pid]))
+        self._record_phase("shared_input_sync", started)
 
         started = perf_counter()
         candidate_pools = self._social_candidate_pools()
         self._record_phase("candidate_pools", started)
 
         started = perf_counter()
-        planned_rows = self.shard_pool.plan_day(
+        self.shard_pool.plan_day(
             day,
-            rows,
+            eligible_order,
             candidate_pools,
             self.actions_per_day,
             self.encounter_sample,
@@ -299,33 +314,21 @@ class AggressiveParallelAgentWorld(ParallelAgentWorld):
         self._record_phase("shard_dispatch", started)
 
         started = perf_counter()
-        plans = {
-            pid: (final_state, day_intents)
-            for pid, final_state, day_intents in planned_rows
-        }
-        self._record_phase("plans_index", started)
-
-        started = perf_counter()
         for pid in eligible_order:
             person = self.people[pid]
-            planned = plans.get(pid)
-            if planned is None or not person.alive or day < person.detained_until_day:
+            if not person.alive or day < person.detained_until_day:
                 continue
-            self._apply_local_state(person, planned[0])
-        self._record_phase("apply_local_state", started)
+            self._apply_local_state(person, self.shared_buffers.read_state(pid))
+        self._record_phase("apply_shared_state", started)
 
         self._help_memory_batch = {}
         started = perf_counter()
         for round_index in range(self.actions_per_day):
             for pid in eligible_order:
                 person = self.people[pid]
-                planned = plans.get(pid)
-                if planned is None or not person.alive or day < person.detained_until_day:
+                if not person.alive or day < person.detained_until_day:
                     continue
-                day_intents = planned[1]
-                if round_index >= len(day_intents):
-                    continue
-                plan = day_intents[round_index]
+                plan = self.shared_buffers.read_intent(pid, round_index)
                 if plan is None:
                     continue
                 kind = plan[0]
@@ -385,12 +388,15 @@ class AggressiveParallelAgentWorld(ParallelAgentWorld):
                     )
             shard = self.shard_pool.summary()
             if shard.get("started"):
+                shared_mib = shard.get("shared_bytes", 0) / (1024 * 1024)
                 print(
-                    "  aggressive shard pool: "
+                    "  aggressive shared shard pool: "
                     f"days={shard.get('days', 0)} tasks={shard.get('tasks', 0)} "
                     f"items={shard.get('items_returned', 0)} "
                     f"worker_cpu={shard.get('worker_seconds', 0.0):.3f}s "
-                    f"dispatch_wall={shard.get('dispatch_seconds', 0.0):.3f}s"
+                    f"dispatch_wall={shard.get('dispatch_seconds', 0.0):.3f}s "
+                    f"shm={shared_mib:.1f}MiB"
                 )
         self.shard_pool.close()
+        self.shared_buffers.close(unlink=True)
         super().close_parallel()
