@@ -1,7 +1,7 @@
 """RAM-first aggressive world.
 
 This layer intentionally spends memory to remove Python object transport from
-the hot action planner.  The previous aggressive implementation remains in
+the hot action planner. The previous aggressive implementation remains in
 aggressive_world_base.py as a fallback/reference implementation.
 """
 
@@ -26,7 +26,7 @@ class AggressiveParallelAgentWorld(BaseAggressiveWorld):
             agent_worker_min_active=agent_worker_min_active,
             **kwargs,
         )
-        # BaseAggressiveWorld allocates the previous shared backend.  Workers are
+        # BaseAggressiveWorld allocates the previous shared backend. Workers are
         # still lazy at this point, so retire those segments and replace them
         # with the RAM-first backend without leaving helper processes behind.
         self.shard_pool.close()
@@ -70,7 +70,7 @@ class AggressiveParallelAgentWorld(BaseAggressiveWorld):
         return len(self.people) <= self.shared_social.population_capacity
 
     def _apply_prepared_move(self, person, plan):
-        """Commit a prepared move but defer market population refresh per location."""
+        """Commit a prepared move and defer market-population refresh."""
         _kind, destination_id, energy_cost = plan
         if (
             not person.alive
@@ -100,16 +100,127 @@ class AggressiveParallelAgentWorld(BaseAggressiveWorld):
         self._dirty_market_population.add(old_id)
         self._dirty_market_population.add(destination_id)
         self.total_moves += 1
-        self.store.event(
-            self.current_day,
-            self.next_sequence(),
-            "move",
-            actor=person,
-            from_location=old_id,
-            to_location=destination_id,
-            energy_cost=int(energy_cost),
-            profession=person.profession,
+        # Aggressive+compact intentionally drops per-move JSON/event rows.
+        # Keep sequence progression stable for the remaining compact events.
+        self.next_sequence()
+
+    def _apply_prepared_buy(self, person, plan):
+        """Commit a prepared purchase without per-purchase event serialization."""
+        _kind, good, requested = plan
+        if (
+            not person.alive
+            or self.current_day < person.detained_until_day
+            or good not in ("food", "medicine")
+            or requested <= 0
+        ):
+            return
+        result = self.goods_market.buy(
+            person.location_id, good, requested, person.money
         )
+        quantity = result["quantity"]
+        cost = result["cost"]
+        person.money -= cost
+        person.market_spending += cost
+        if good == "food":
+            person.food += int(quantity)
+        else:
+            person.medicine += int(quantity)
+        if result["shortage"]:
+            person.shortage_experiences += 1
+            person.shift_ideology(-0.00025)
+        for employer_id, revenue in result["seller_revenue"].items():
+            self.labor_market.credit_sale(employer_id, revenue)
+        # State/market effects are authoritative; the high-volume JSON event is
+        # deliberately omitted in throughput-first mode.
+        self.next_sequence()
+
+    def _apply_prepared_social(self, person, prepared):
+        """Use worker-owned social memory; main resolves only real-world effects."""
+        _pid, action, target_id, payload, witness_ids = prepared
+        if action == "help":
+            return super()._apply_prepared_social(person, prepared)
+        if (
+            target_id is None
+            or not person.alive
+            or self.current_day < person.detained_until_day
+            or target_id >= len(self.people)
+        ):
+            return
+        target = self.people[target_id]
+        if not target.alive or target.location_id != person.location_id:
+            return
+
+        if action == "steal":
+            resource, proposed = payload
+            amount = 0
+            if resource == "food" and proposed:
+                amount = min(target.food, int(proposed))
+                target.food -= amount
+                person.food += amount
+            elif resource == "money" and proposed:
+                amount = min(target.money, float(proposed))
+                target.money -= amount
+                person.money += amount
+            elif resource == "medicine" and proposed and target.medicine > 0:
+                amount = 1
+                target.medicine -= 1
+                person.medicine += 1
+
+            self.store.event(
+                self.current_day,
+                self.next_sequence(),
+                "steal",
+                actor=person,
+                target=target,
+                success=int(bool(amount)),
+                location_id=person.location_id,
+                resource=resource,
+                amount=amount,
+            )
+            if not amount:
+                return
+            self.total_thefts += 1
+            target.crime_suffered += 1
+            self.daily_crimes[person.location_id] += 1
+            magnitude = max(1.0, float(amount) / 2.0)
+        else:
+            damage, energy_cost = payload
+            damage = int(damage)
+            person.energy = max(0, person.energy - int(energy_cost))
+            target.health -= damage
+            self.total_attacks += 1
+            target.crime_suffered += 1
+            self.daily_crimes[person.location_id] += 1
+            self.store.event(
+                self.current_day,
+                self.next_sequence(),
+                "attack",
+                actor=person,
+                target=target,
+                success=1,
+                location_id=person.location_id,
+                damage=damage,
+                killed=target.health <= 0,
+            )
+            magnitude = float(damage) / 10.0
+
+        # Relationship state used by aggressive planning already lives in the
+        # persistent worker cache. Do not build a duplicate Python memory graph
+        # in main. Preserve observation totals cheaply for statistics.
+        for witness_id in witness_ids:
+            if witness_id >= len(self.people):
+                continue
+            witness = self.people[witness_id]
+            if (
+                witness.alive
+                and witness.location_id == person.location_id
+                and witness.id not in (person.id, target.id)
+            ):
+                self.total_observations += 1
+
+        self.police_response(action, person, target, magnitude)
+        if action == "attack" and target.health <= 0:
+            self.kill(target, "violence")
 
     def _flush_move_populations(self):
         if not self._dirty_market_population:
