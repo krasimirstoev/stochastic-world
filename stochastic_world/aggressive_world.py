@@ -13,9 +13,8 @@ class AggressiveParallelAgentWorld(ParallelAgentWorld):
     Workers plan all action rounds for their fixed pid shard in one dispatch per
     simulated day. Main remains authoritative for shared-state mutations.
 
-    Aggressive mode also records coarse wall-clock timings so expensive IPC and
-    synchronization phases can be identified without cProfile distorting worker
-    behavior.
+    The aggressive planner keeps a lightweight actor-side social cache inside
+    each worker so relationship payloads do not grow with simulation age.
     """
 
     def __init__(self, *args, agent_workers=0, agent_worker_min_active=64, **kwargs):
@@ -46,14 +45,9 @@ class AggressiveParallelAgentWorld(ParallelAgentWorld):
         self._intent_calls[action] += 1
 
     def _shard_row(self, person):
-        memories = tuple(
-            (
-                other_id,
-                (memory.trust, memory.grievance, memory.familiarity),
-            )
-            for other_id, memory in person.memories.items()
-        )
-        return (self._action_snapshot(person), memories)
+        # Social relationships intentionally stay out of the daily IPC payload.
+        # Workers keep an approximate actor-side cache across days.
+        return self._action_snapshot(person)
 
     @staticmethod
     def _apply_local_state(person, final_state):

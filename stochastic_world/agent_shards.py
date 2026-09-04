@@ -30,20 +30,61 @@ def _sample_candidates(pool, actor_id, limit, stream):
     return result
 
 
-def _weighted_pick(candidates, memories, mode, stream):
+def _materialize_memory(memories, target_id, day):
+    memory = memories.get(target_id)
+    if memory is None:
+        return None
+    trust, grievance, familiarity, decayed_day = memory
+    day = int(day)
+    if day > decayed_day:
+        days = day - decayed_day
+        grievance = max(0.0, grievance - 0.35 * days)
+        trust_decay = 0.0875 * days
+        if trust > 0:
+            trust = max(0.0, trust - trust_decay)
+        elif trust < 0:
+            trust = min(0.0, trust + trust_decay)
+        memory = [trust, grievance, familiarity, day]
+        memories[target_id] = memory
+    return memory
+
+
+def _remember_actor(memories, target_id, action, magnitude, day):
+    memory = _materialize_memory(memories, target_id, day)
+    if memory is None:
+        memory = [0.0, 0.0, 0, int(day)]
+        memories[target_id] = memory
+    trust, grievance, familiarity, _decayed_day = memory
+    familiarity += 1
+    magnitude = float(magnitude)
+    if action == "help":
+        trust += 4.0 * magnitude
+    elif action == "steal":
+        trust -= 2.0 * magnitude
+        grievance += 1.0 * magnitude
+    elif action == "attack":
+        trust -= 3.0 * magnitude
+        grievance += 2.0 * magnitude
+    memory[0] = max(-100.0, min(100.0, trust))
+    memory[1] = max(0.0, min(100.0, grievance))
+    memory[2] = familiarity
+    memory[3] = int(day)
+
+
+def _weighted_pick(candidates, memories, mode, stream, day):
     if not candidates:
         return None
     weighted = []
     total = 0.0
     for target in candidates:
         target_id, food, medicine, money, _health = target
-        memory = memories.get(target_id)
+        memory = _materialize_memory(memories, target_id, day)
         if memory is None:
             affinity = 0.0
             conflict = 0.0
             familiarity = 0
         else:
-            trust, grievance, familiarity = memory
+            trust, grievance, familiarity, _decayed_day = memory
             affinity = max(-100.0, min(100.0, trust - grievance))
             conflict = max(0.0, grievance - min(0.0, trust))
         if mode == "help":
@@ -106,7 +147,7 @@ def _social_plan(state, action, memories, pools, master_seed, day, round_index, 
     stream = _DeterministicStream(_seed_for(master_seed, day, state["pid"], _PHASE_SOCIAL, round_index))
     pool = pools.get(state["location_id"], ())
     candidates = _sample_candidates(pool, state["pid"], encounter_sample, stream)
-    target = _weighted_pick(candidates, memories, action, stream)
+    target = _weighted_pick(candidates, memories, action, stream, day)
     if target is None:
         return (action, None, None, ())
     target_id, target_food, target_medicine, target_money, target_health = target
@@ -147,8 +188,25 @@ def _social_plan(state, action, memories, pools, master_seed, day, round_index, 
     return (action, target_id, payload, witness_ids)
 
 
-def _plan_shard_row(row, pools, master_seed, day, actions_per_day, encounter_sample, max_witnesses, visibility):
-    snapshot, memories_tuple = row
+def _remember_planned_social(memories, social, day):
+    action, target_id, payload, _witness_ids = social
+    if target_id is None or payload is None:
+        return
+    magnitude = 0.0
+    if action == "help":
+        _resource, amount = payload
+        magnitude = float(amount or 0)
+    elif action == "steal":
+        _resource, amount = payload
+        magnitude = max(1.0, float(amount) / 2.0) if amount else 0.0
+    else:
+        damage, _energy_cost = payload
+        magnitude = float(damage) / 10.0
+    if magnitude > 0:
+        _remember_actor(memories, target_id, action, magnitude, day)
+
+
+def _plan_shard_row(snapshot, memories, pools, master_seed, day, actions_per_day, encounter_sample, max_witnesses, visibility):
     (
         pid, location_id, food, medicine, energy, health, shelter, money,
         has_employer, location_kind, positive_ties, hostile_ties,
@@ -173,7 +231,6 @@ def _plan_shard_row(row, pools, master_seed, day, actions_per_day, encounter_sam
         "scavenge_food_max": scavenge_food_max,
         "medicine_chance": medicine_chance,
     }
-    memories = dict(memories_tuple)
     intents = []
     for round_index in range(int(actions_per_day)):
         _, action = _weighted_action(_action_snapshot(state), master_seed, day, round_index)
@@ -187,7 +244,10 @@ def _plan_shard_row(row, pools, master_seed, day, actions_per_day, encounter_sam
                 state, action, memories, pools, master_seed, day, round_index,
                 encounter_sample, max_witnesses, visibility,
             )
+            _remember_planned_social(memories, social, day)
             intents.append(("social",) + social)
+        elif action == "idle":
+            intents.append(None)
         else:
             intents.append(("shared", action))
     final_state = (
@@ -198,19 +258,23 @@ def _plan_shard_row(row, pools, master_seed, day, actions_per_day, encounter_sam
 
 
 def _worker_main(worker_id, input_queue, result_queue, master_seed):
+    social_cache = {}
     while True:
         task = input_queue.get()
         if task is None:
             return
         day, rows, pools, actions_per_day, encounter_sample, max_witnesses, visibility = task
         started = perf_counter()
-        results = [
-            _plan_shard_row(
-                row, pools, master_seed, day, actions_per_day,
-                encounter_sample, max_witnesses, visibility,
+        results = []
+        for snapshot in rows:
+            pid = snapshot[0]
+            memories = social_cache.setdefault(pid, {})
+            results.append(
+                _plan_shard_row(
+                    snapshot, memories, pools, master_seed, day, actions_per_day,
+                    encounter_sample, max_witnesses, visibility,
+                )
             )
-            for row in rows
-        ]
         result_queue.put((worker_id, perf_counter() - started, len(rows), results))
 
 
@@ -258,17 +322,25 @@ class PersistentDayShardPool:
         if not rows:
             return []
         if not self.should_parallelize(len(rows)):
+            local_cache = {}
             return [
                 _plan_shard_row(
-                    row, pools, self.master_seed, day, actions_per_day,
-                    encounter_sample, max_witnesses, visibility,
+                    row,
+                    local_cache.setdefault(row[0], {}),
+                    pools,
+                    self.master_seed,
+                    day,
+                    actions_per_day,
+                    encounter_sample,
+                    max_witnesses,
+                    visibility,
                 )
                 for row in rows
             ]
         self._ensure_started()
         shards = [[] for _ in range(self.worker_count)]
         for row in rows:
-            shards[row[0][0] % self.worker_count].append(row)
+            shards[row[0] % self.worker_count].append(row)
         active = [(worker_id, shard) for worker_id, shard in enumerate(shards) if shard]
         started = perf_counter()
         for worker_id, shard in active:
