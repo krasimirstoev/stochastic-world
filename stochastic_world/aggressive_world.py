@@ -4,7 +4,7 @@ from time import perf_counter
 from .agent_shards import PersistentDayShardPool
 from .agent_world import ParallelAgentWorld
 from .population_index import permutation_ids
-from .professions import profession_for, workplace_fit
+from .professions import PROFESSIONS
 
 
 class AggressiveParallelAgentWorld(ParallelAgentWorld):
@@ -13,8 +13,9 @@ class AggressiveParallelAgentWorld(ParallelAgentWorld):
     Workers plan all action rounds for their fixed pid shard in one dispatch per
     simulated day. Main remains authoritative for shared-state mutations.
 
-    The aggressive planner keeps a lightweight actor-side social cache inside
-    each worker so relationship payloads do not grow with simulation age.
+    Aggressive mode also records coarse wall-clock timings so expensive IPC and
+    synchronization phases can be identified without cProfile distorting worker
+    behavior.
     """
 
     def __init__(self, *args, agent_workers=0, agent_worker_min_active=64, **kwargs):
@@ -45,8 +46,6 @@ class AggressiveParallelAgentWorld(ParallelAgentWorld):
         self._intent_calls[action] += 1
 
     def _shard_row(self, person):
-        # Social relationships intentionally stay out of the daily IPC payload.
-        # Workers keep an approximate actor-side cache across days.
         return self._action_snapshot(person)
 
     @staticmethod
@@ -61,13 +60,8 @@ class AggressiveParallelAgentWorld(ParallelAgentWorld):
         ) = final_state
 
     def work(self, person):
-        """Compact-mode work path without constructing filtered work/rest events."""
-        if not person.is_working_age:
-            person.energy = min(100, person.energy + self.rng.randint(12, 24))
-            person.health = min(100, person.health + self.rng.randint(0, 2))
-            self.next_sequence()
-            return
-        if person.energy < 8:
+        """Compact aggressive work path with one profession/fit/wage calculation."""
+        if not person.is_working_age or person.energy < 8:
             person.energy = min(100, person.energy + self.rng.randint(12, 24))
             person.health = min(100, person.health + self.rng.randint(0, 2))
             self.next_sequence()
@@ -104,9 +98,23 @@ class AggressiveParallelAgentWorld(ParallelAgentWorld):
         if employer.location_id != person.location_id:
             return
 
-        location = self.location_of(person)
-        shift = self.labor_market.work_shift(person, location)
-        if shift["insolvent"]:
+        location = self.locations[person.location_id]
+        profession = PROFESSIONS[person.profession]
+        fit = 1.15 if location.kind in profession.workplace_kinds else 0.82
+        scarcity = 1.10 if employer.vacancies > max(1, employer.capacity // 3) else 1.0
+        preferred = 1.08 if person.profession in employer.preferred_professions else 0.92
+        gross = max(
+            1,
+            round(
+                employer.base_wage
+                * profession.income_multiplier
+                * fit
+                * scarcity
+                * preferred
+            ),
+        )
+
+        if employer.cash < gross:
             self.labor_market.terminate(person, "insolvent")
             self.store.employment_event(
                 self.current_day, person, employer, "laid_off", "insolvent"
@@ -121,9 +129,24 @@ class AggressiveParallelAgentWorld(ParallelAgentWorld):
             )
             return
 
-        gross = shift["gross"]
-        profession = profession_for(person)
-        fit = workplace_fit(person, location)
+        employer.cash -= gross
+        employer.payroll_since_review += gross
+        produced_good = employer.output_good
+        produced = 0.0
+        if produced_good:
+            produced = max(
+                0.0,
+                employer.output_per_shift
+                * employer.productivity
+                * fit
+                * self.rng.uniform(0.85, 1.15),
+            )
+            employer.units_produced_since_review += produced
+        elif employer.kind != "logistics":
+            service_revenue = gross * employer.productivity * self.rng.uniform(1.12, 1.45)
+            employer.cash += service_revenue
+            employer.revenue_since_review += service_revenue
+
         energy = max(
             3,
             round(self.rng.randint(6, 12) * profession.energy_multiplier),
@@ -134,12 +157,12 @@ class AggressiveParallelAgentWorld(ParallelAgentWorld):
         person.career_progress += profession.advancement_rate * fit
         self.politics.collect_tax(person, gross)
         person.energy = max(0, person.energy - energy)
-        if shift["produced_good"] and shift["produced"] > 0:
+        if produced_good and produced > 0:
             self.goods_market.add_supply(
                 person.location_id,
                 employer.id,
-                shift["produced_good"],
-                shift["produced"],
+                produced_good,
+                produced,
             )
         self.next_sequence()
 
