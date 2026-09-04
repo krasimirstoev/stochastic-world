@@ -48,50 +48,16 @@ class AggressiveParallelAgentWorld(ParallelAgentWorld):
         )
         return (self._action_snapshot(person), memories)
 
-    def _apply_shard_safe(self, person, action, event_data):
-        if event_data is None:
-            return
-        if action == "rest":
-            energy_gain, health_gain = event_data
-            person.energy = min(100, person.energy + int(energy_gain))
-            person.health = min(100, person.health + int(health_gain))
-            self.store.event(
-                self.current_day, self.next_sequence(), "rest",
-                actor=person, location_id=person.location_id,
-                energy_gain=energy_gain, health_gain=health_gain,
-            )
-            return
-        if action == "heal":
-            if person.medicine <= 0 or person.health >= 100:
-                return
-            (gain,) = event_data
-            person.medicine -= 1
-            person.health = min(100, person.health + int(gain))
-            self.store.event(
-                self.current_day, self.next_sequence(), "heal",
-                actor=person, location_id=person.location_id, health_gain=gain,
-            )
-            return
-        if action == "repair":
-            if person.money < 3 or person.shelter >= 100:
-                return
-            (gain,) = event_data
-            person.money -= 3
-            person.shelter = min(100, person.shelter + int(gain))
-            self.store.event(
-                self.current_day, self.next_sequence(), "repair",
-                actor=person, location_id=person.location_id, shelter_gain=gain,
-            )
-            return
-        food_found, medicine_found, cost = event_data
-        person.energy = max(0, person.energy - int(cost))
-        person.food += int(food_found)
-        person.medicine += int(medicine_found)
-        self.store.event(
-            self.current_day, self.next_sequence(), "scavenge",
-            actor=person, location_id=person.location_id,
-            food_found=food_found, medicine_found=medicine_found, energy_cost=cost,
-        )
+    @staticmethod
+    def _apply_local_state(person, final_state):
+        (
+            person.food,
+            person.medicine,
+            person.energy,
+            person.health,
+            person.shelter,
+            person.money,
+        ) = final_state
 
     def _run_parallel_actions(self, day):
         if not self.shard_pool.should_parallelize(self.alive_count):
@@ -136,27 +102,36 @@ class AggressiveParallelAgentWorld(ParallelAgentWorld):
         self._record_phase("shard_dispatch", started)
 
         started = perf_counter()
-        plans = {pid: day_plans for pid, day_plans in planned_rows}
+        plans = {
+            pid: (final_state, day_intents)
+            for pid, final_state, day_intents in planned_rows
+        }
         self._record_phase("plans_index", started)
+
+        started = perf_counter()
+        for pid in eligible_order:
+            person = self.people[pid]
+            planned = plans.get(pid)
+            if planned is None or not person.alive or day < person.detained_until_day:
+                continue
+            self._apply_local_state(person, planned[0])
+        self._record_phase("apply_local_state", started)
 
         started = perf_counter()
         for round_index in range(self.actions_per_day):
             for pid in eligible_order:
                 person = self.people[pid]
-                day_plans = plans.get(pid)
-                if (
-                    day_plans is None
-                    or round_index >= len(day_plans)
-                    or not person.alive
-                    or day < person.detained_until_day
-                ):
+                planned = plans.get(pid)
+                if planned is None or not person.alive or day < person.detained_until_day:
                     continue
-                plan = day_plans[round_index]
+                day_intents = planned[1]
+                if round_index >= len(day_intents):
+                    continue
+                plan = day_intents[round_index]
+                if plan is None:
+                    continue
                 kind = plan[0]
-                if kind == "safe":
-                    _, action, event_data = plan
-                    self._apply_shard_safe(person, action, event_data)
-                elif kind == "social":
+                if kind == "social":
                     _, action, target_id, payload, witness_ids = plan
                     self._apply_prepared_social(
                         person,
@@ -165,7 +140,7 @@ class AggressiveParallelAgentWorld(ParallelAgentWorld):
                 else:
                     _, action = plan
                     self._execute_shared_intent(person, action)
-        self._record_phase("apply_plans", started)
+        self._record_phase("apply_intents", started)
         self._record_phase("actions_total", total_started)
 
     def aggressive_profile_summary(self):

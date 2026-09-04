@@ -78,35 +78,28 @@ def _action_snapshot(state):
     )
 
 
-def _safe_plan(state, action, master_seed, day, round_index):
+def _safe_apply(state, action, master_seed, day, round_index):
     stream = _DeterministicStream(_seed_for(master_seed, day, state["pid"], _PHASE_SAFE, round_index))
     if action == "rest":
-        energy_gain = stream.randint(12, 24)
-        health_gain = stream.randint(0, 2)
-        state["energy"] = min(100, state["energy"] + energy_gain)
-        state["health"] = min(100, state["health"] + health_gain)
-        return (energy_gain, health_gain)
+        state["energy"] = min(100, state["energy"] + stream.randint(12, 24))
+        state["health"] = min(100, state["health"] + stream.randint(0, 2))
+        return
     if action == "heal":
         if state["medicine"] <= 0 or state["health"] >= 100:
-            return None
-        gain = stream.randint(8, 18)
+            return
         state["medicine"] -= 1
-        state["health"] = min(100, state["health"] + gain)
-        return (gain,)
+        state["health"] = min(100, state["health"] + stream.randint(8, 18))
+        return
     if action == "repair":
         if state["money"] < 3 or state["shelter"] >= 100:
-            return None
-        gain = stream.randint(8, 16)
+            return
         state["money"] -= 3
-        state["shelter"] = min(100, state["shelter"] + gain)
-        return (gain,)
+        state["shelter"] = min(100, state["shelter"] + stream.randint(8, 16))
+        return
     cost = stream.randint(4, 9)
-    food_found = stream.randint(0, state["scavenge_food_max"])
-    medicine_found = int(stream.random() < state["medicine_chance"])
+    state["food"] += stream.randint(0, state["scavenge_food_max"])
+    state["medicine"] += int(stream.random() < state["medicine_chance"])
     state["energy"] = max(0, state["energy"] - cost)
-    state["food"] += food_found
-    state["medicine"] += medicine_found
-    return (food_found, medicine_found, cost)
 
 
 def _social_plan(state, action, memories, pools, master_seed, day, round_index, encounter_sample, max_witnesses, visibility):
@@ -181,23 +174,27 @@ def _plan_shard_row(row, pools, master_seed, day, actions_per_day, encounter_sam
         "medicine_chance": medicine_chance,
     }
     memories = dict(memories_tuple)
-    plans = []
+    intents = []
     for round_index in range(int(actions_per_day)):
         _, action = _weighted_action(_action_snapshot(state), master_seed, day, round_index)
         if not is_working_age and action not in {"scavenge", "buy_supplies", "rest", "heal", "repair", "help"}:
             action = "rest"
         if action in _SAFE_ACTIONS:
-            event_data = _safe_plan(state, action, master_seed, day, round_index)
-            plans.append(("safe", action, event_data))
+            _safe_apply(state, action, master_seed, day, round_index)
+            intents.append(None)
         elif action in _SOCIAL_ACTIONS:
             social = _social_plan(
                 state, action, memories, pools, master_seed, day, round_index,
                 encounter_sample, max_witnesses, visibility,
             )
-            plans.append(("social",) + social)
+            intents.append(("social",) + social)
         else:
-            plans.append(("shared", action))
-    return (pid, tuple(plans))
+            intents.append(("shared", action))
+    final_state = (
+        state["food"], state["medicine"], state["energy"],
+        state["health"], state["shelter"], state["money"],
+    )
+    return (pid, final_state, tuple(intents))
 
 
 def _worker_main(worker_id, input_queue, result_queue, master_seed):
