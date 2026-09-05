@@ -1,10 +1,14 @@
 import random
+from time import perf_counter
 
 from faker import Faker
 
 from .person import Person, RETIREMENT_AGE_DAYS
 from .professions import choose_profession
 
+
+LARGE_POPULATION_FAST_PATH = 100_000
+LAST_BUILD_PROFILE = {}
 
 CLASS_PROFILES = {
     "working":      {"weight": 38, "money": 10, "food": 8,  "shelter": 58, "ideology": -0.22},
@@ -23,24 +27,47 @@ AGE_BANDS = (
     (85, 95, 2),
 )
 
+_CLASSES = tuple(CLASS_PROFILES)
+_CLASS_THRESHOLDS = (38.0, 65.0, 87.0, 97.0, 100.0)
+_AGE_THRESHOLDS = (16.0, 28.0, 58.0, 83.0, 98.0, 100.0)
 
-def _initial_age_days(rng):
-    lo, hi, _ = rng.choices(AGE_BANDS, weights=[x[2] for x in AGE_BANDS], k=1)[0]
+
+def _pick_threshold(rng, values, thresholds):
+    roll = rng.random() * 100.0
+    for index, threshold in enumerate(thresholds):
+        if roll < threshold:
+            return values[index]
+    return values[-1]
+
+
+def _initial_age_days(rng, fast=False):
+    if fast:
+        lo, hi, _ = _pick_threshold(rng, AGE_BANDS, _AGE_THRESHOLDS)
+    else:
+        lo, hi, _ = rng.choices(AGE_BANDS, weights=[x[2] for x in AGE_BANDS], k=1)[0]
     return rng.randint(lo * 365, (hi + 1) * 365 - 1)
 
 
 def build_population(size: int, seed: int, locale: str = "en_US") -> list[Person]:
-    fake = Faker(locale)
-    fake.seed_instance(seed)
+    global LAST_BUILD_PROFILE
+    started = perf_counter()
+    fast = int(size) >= LARGE_POPULATION_FAST_PATH
+    fake = None
+    if not fast:
+        fake = Faker(locale)
+        fake.seed_instance(seed)
     rng = random.Random(seed ^ 0x5A17C1A55)
     people = []
     classes = list(CLASS_PROFILES)
     weights = [CLASS_PROFILES[c]["weight"] for c in classes]
 
     for pid in range(size):
-        social_class = rng.choices(classes, weights=weights, k=1)[0]
+        if fast:
+            social_class = _pick_threshold(rng, _CLASSES, _CLASS_THRESHOLDS)
+        else:
+            social_class = rng.choices(classes, weights=weights, k=1)[0]
         profile = CLASS_PROFILES[social_class]
-        age_days = _initial_age_days(rng)
+        age_days = _initial_age_days(rng, fast=fast)
         ideology = max(-1.0, min(1.0, profile["ideology"] + rng.gauss(0, 0.22)))
         if age_days < 18 * 365:
             profession = "dependent"
@@ -50,7 +77,7 @@ def build_population(size: int, seed: int, locale: str = "en_US") -> list[Person
             profession = choose_profession(social_class, rng)
         people.append(Person(
             id=pid,
-            name=fake.name(),
+            name=f"A{pid}" if fast else fake.name(),
             social_class=social_class,
             profession=profession,
             ideology=ideology,
@@ -62,4 +89,9 @@ def build_population(size: int, seed: int, locale: str = "en_US") -> list[Person
             sex="female" if rng.random() < 0.5 else "male",
             retired=age_days >= RETIREMENT_AGE_DAYS,
         ))
+    LAST_BUILD_PROFILE = {
+        "seconds": perf_counter() - started,
+        "fast_identity": bool(fast),
+        "population": int(size),
+    }
     return people
