@@ -32,7 +32,10 @@ class TransportSystem:
             e for e in self.labor_market.local_employers(source_id)
             if e.alive and (e.kind in ("market", "industrial", "logistics") or e.output_good is None)
         ]
-        worker_capacity = sum(max(1, len(e.employee_ids)) for e in firms)
+        worker_capacity = sum(
+            max(1, int(getattr(e, "_domain_employee_count", len(e.employee_ids))))
+            for e in firms
+        )
         return max(2.0, worker_capacity * self.capacity_per_1000)
 
     def rebalance(self, day):
