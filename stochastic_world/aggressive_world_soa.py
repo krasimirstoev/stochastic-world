@@ -161,31 +161,60 @@ class AggressiveParallelAgentWorld(TemporalAggressiveWorld):
         self._record_phase("soa_cold_resync", started)
 
     def _run_soa_cold_day(self, day):
-        if self._soa_initialized:
-            self._soa_reconcile_to_world()
+        # The SoA state is authoritative between cold barriers. Reconstructing the
+        # entire Python world before this day's action phase is redundant: the
+        # packet uses aggregate economy / market / police state, which is already
+        # kept current every hot day. Reconcile exactly once, after the actions,
+        # when monthly lifecycle code genuinely needs Person objects and indexes.
+        barrier_started = perf_counter()
         self.current_day = day
         if day == 1 or (day - 1) % ELECTION_INTERVAL_DAYS == 0:
             self.run_election()
+
+        started = perf_counter()
         self._run_soa_domain(day, fuse_eod=False)
+        self._record_phase("soa_cold_actions", started)
+
         self._soa_reconcile_to_world(count_new_deaths=True)
+
+        started = perf_counter()
         for shipment in self.transport.rebalance(day):
             self.store.shipment(shipment)
+        self._record_phase("soa_cold_transport", started)
+
+        started = perf_counter()
         if day % BUSINESS_INTERVAL_DAYS == 0:
             self.welfare_cycle()
             self.business_cycle()
             self.police.rebalance()
+        self._record_phase("soa_cold_business", started)
+
+        started = perf_counter()
         ScaleAggressiveWorld._run_parallel_end_of_day(self)
+        self._record_phase("soa_cold_eod", started)
+
         self.goods_market.reprice()
+
+        started = perf_counter()
         if day % MOBILITY_INTERVAL_DAYS == 0:
             self.mobility_cycle()
+        self._record_phase("soa_cold_mobility", started)
+
+        started = perf_counter()
         police_snapshot = self.police.end_day()
         ScaleAggressiveWorld._write_population_stats_fast(self, day, police_snapshot)
         self.store.commit_day()
+        self._record_phase("soa_cold_stats", started)
+
+        started = perf_counter()
         if day % DEMOGRAPHIC_INTERVAL_DAYS == 0:
             self.demographics.cycle(day)
             self.demographics.write_stats(day)
             self.store.commit_day()
+        self._record_phase("soa_cold_demographics", started)
+
         self._resync_soa_from_world()
+        self._record_phase("soa_cold_barrier_total", barrier_started)
 
     def run_day(self, day):
         if not self.soa_mode:
