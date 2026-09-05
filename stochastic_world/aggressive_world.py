@@ -6,9 +6,12 @@ from . import population as _population
 from .aggressive_jit import install as _install_jit
 
 try:
-    from .aggressive_world_soa import AggressiveParallelAgentWorld as _BaseWorld
+    from .aggressive_world_demographic import AggressiveParallelAgentWorld as _BaseWorld
 except ImportError:
-    from .aggressive_world_temporal import AggressiveParallelAgentWorld as _BaseWorld
+    try:
+        from .aggressive_world_soa import AggressiveParallelAgentWorld as _BaseWorld
+    except ImportError:
+        from .aggressive_world_temporal import AggressiveParallelAgentWorld as _BaseWorld
 
 
 class AggressiveParallelAgentWorld(_BaseWorld):
