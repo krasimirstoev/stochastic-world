@@ -198,6 +198,10 @@ class AggressiveParallelAgentWorld(TemporalAggressiveWorld):
         started = perf_counter()
         if day % MOBILITY_INTERVAL_DAYS == 0:
             self.mobility_cycle()
+            # EOD fused stats describe the pre-mobility population. Preserve the
+            # legacy reporting order by forcing the stats writer to rescan only
+            # on the rare mobility boundary.
+            self._eod_population_stats = None
         self._record_phase("soa_cold_mobility", started)
 
         started = perf_counter()
