@@ -1,13 +1,14 @@
 """Demographic-authoritative layer for the 100k+ aggressive SoA engine.
 
 Normal monthly lifecycle boundaries stay entirely in array state. Full Person
-materialization is reserved for mobility, election/reporting and explicit
-fallback boundaries.
+materialization is reserved for elections/reporting and explicit fallback
+boundaries.
 """
 
 from time import perf_counter
 
 from .aggressive_demographics import SoADemographicState
+from .aggressive_mobility import run_soa_mobility
 from .aggressive_soa import B_WORKING_AGE
 from .aggressive_world_soa import AggressiveParallelAgentWorld as SoAAggressiveWorld
 from .labor_market import BUSINESS_INTERVAL_DAYS
@@ -15,7 +16,7 @@ from .professions import MOBILITY_INTERVAL_DAYS
 
 
 class AggressiveParallelAgentWorld(SoAAggressiveWorld):
-    """SoA world with vectorized monthly demographics."""
+    """SoA world with vectorized monthly demographics and mobility."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -66,12 +67,6 @@ class AggressiveParallelAgentWorld(SoAAggressiveWorld):
         self._record_phase("soa_demographic_resync", started)
 
     def _run_soa_cold_day(self, day):
-        # Mobility still mutates Person social/profession state and therefore
-        # keeps the exact legacy boundary. All ordinary monthly boundaries stay
-        # array-authoritative.
-        if day % MOBILITY_INTERVAL_DAYS == 0:
-            return super()._run_soa_cold_day(day)
-
         barrier_started = perf_counter()
         self.current_day = day
 
@@ -95,6 +90,11 @@ class AggressiveParallelAgentWorld(SoAAggressiveWorld):
         if stats is None:
             self._record_phase("soa_cold_barrier_total", barrier_started)
             return
+
+        if day % MOBILITY_INTERVAL_DAYS == 0:
+            started = perf_counter()
+            run_soa_mobility(self, day, stats)
+            self._record_phase("soa_cold_mobility_soa", started)
 
         started = perf_counter()
         police_snapshot = self._finish_temporal_police(stats)
