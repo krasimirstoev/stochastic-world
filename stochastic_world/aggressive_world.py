@@ -1,11 +1,15 @@
 """Public entry point for the aggressive engine."""
 
 from .aggressive_jit import install as _install_jit
-from .aggressive_world_temporal import AggressiveParallelAgentWorld as _TemporalWorld
+
+try:
+    from .aggressive_world_soa import AggressiveParallelAgentWorld as _BaseWorld
+except ImportError:
+    from .aggressive_world_temporal import AggressiveParallelAgentWorld as _BaseWorld
 
 
-class AggressiveParallelAgentWorld(_TemporalWorld):
-    """Temporal BSP world with optional Numba hot kernels."""
+class AggressiveParallelAgentWorld(_BaseWorld):
+    """SoA / temporal aggressive world with optional Numba acceleration."""
 
     def __init__(self, *args, **kwargs):
         self._aggressive_jit_enabled = bool(_install_jit())
