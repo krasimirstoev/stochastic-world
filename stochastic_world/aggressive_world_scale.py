@@ -39,77 +39,6 @@ class AggressiveParallelAgentWorld(RamAggressiveWorld):
             self.shared_end_buffers,
             workers=agent_workers,
         )
-        self._eod_population_stats = None
-
-    def _new_population_accumulator(self):
-        return {
-            "alive": 0,
-            "food": 0.0,
-            "money": 0.0,
-            "medicine": 0.0,
-            "energy": 0.0,
-            "shelter": 0.0,
-            "health": 0.0,
-            "ideology": 0.0,
-            "taxes": 0.0,
-            "welfare": 0.0,
-            "left": 0,
-            "right": 0,
-            "workforce": 0,
-            "employed": 0,
-            "loc_n": [0] * len(self.locations),
-            "loc_food": [0.0] * len(self.locations),
-            "loc_money": [0.0] * len(self.locations),
-            "loc_health": [0.0] * len(self.locations),
-            "social": {
-                name: [0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-                for name in _SOCIAL_CLASSES
-            },
-        }
-
-    @staticmethod
-    def _accumulate_population_row(stats, person):
-        stats["alive"] += 1
-        food = float(person.food)
-        money = float(person.money)
-        medicine = float(person.medicine)
-        energy = float(person.energy)
-        shelter = float(person.shelter)
-        health = float(person.health)
-        ideology = float(person.ideology)
-        stats["food"] += food
-        stats["money"] += money
-        stats["medicine"] += medicine
-        stats["energy"] += energy
-        stats["shelter"] += shelter
-        stats["health"] += health
-        stats["ideology"] += ideology
-        stats["taxes"] += float(person.taxes_paid)
-        stats["welfare"] += float(person.welfare_received)
-        if ideology < 0:
-            stats["left"] += 1
-        else:
-            stats["right"] += 1
-
-        lid = int(person.location_id)
-        stats["loc_n"][lid] += 1
-        stats["loc_food"][lid] += food
-        stats["loc_money"][lid] += money
-        stats["loc_health"][lid] += health
-
-        bucket = stats["social"].get(person.social_class)
-        if bucket is not None:
-            bucket[0] += 1
-            bucket[1] += money
-            bucket[2] += food
-            bucket[3] += shelter
-            bucket[4] += health
-            bucket[5] += ideology
-            bucket[6] += float(person.work_experience)
-
-        if person.is_working_age:
-            stats["workforce"] += 1
-            stats["employed"] += int(person.employer_id is not None)
 
     def _run_parallel_end_of_day(self):
         if not self.large_scale_mode or not self.shared_end_pool.enabled:
@@ -141,7 +70,6 @@ class AggressiveParallelAgentWorld(RamAggressiveWorld):
         self._record_phase("eod_dispatch", started)
 
         started = perf_counter()
-        stats = self._new_population_accumulator()
         for person in self.people:
             if not person.alive or not self.shared_end_buffers.is_active(person.id):
                 continue
@@ -149,31 +77,76 @@ class AggressiveParallelAgentWorld(RamAggressiveWorld):
                 person,
                 self.shared_end_buffers.read_delta(person.id),
             )
-            if person.alive:
-                self._accumulate_population_row(stats, person)
-        self._eod_population_stats = (int(self.current_day), stats)
         self._record_phase("eod_apply", started)
         self.daily_crimes.clear()
-        return stats
-
-    def _scan_population_stats(self):
-        stats = self._new_population_accumulator()
-        for person in self.people:
-            if person.alive:
-                self._accumulate_population_row(stats, person)
-        return stats
 
     def _write_population_stats_fast(self, day, police_snapshot):
-        """Write population-derived daily statistics, reusing fused EOD stats when available."""
+        """Write all population-derived daily statistics from one O(N) scan."""
         started = perf_counter()
-        cached = self._eod_population_stats
-        if cached is not None and int(cached[0]) == int(day):
-            stats = cached[1]
-            self._eod_population_stats = None
-        else:
-            stats = self._scan_population_stats()
+        location_count = len(self.locations)
+        loc_n = [0] * location_count
+        loc_food = [0.0] * location_count
+        loc_money = [0.0] * location_count
+        loc_health = [0.0] * location_count
 
-        alive = int(stats["alive"])
+        alive = 0
+        sum_food = sum_money = sum_medicine = 0.0
+        sum_energy = sum_shelter = sum_health = 0.0
+        sum_ideology = sum_taxes = sum_welfare = 0.0
+        left_leaning = right_leaning = 0
+        workforce = employed = 0
+
+        social = {
+            name: [0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+            for name in _SOCIAL_CLASSES
+        }
+
+        for person in self.people:
+            if not person.alive:
+                continue
+            alive += 1
+            food = float(person.food)
+            money = float(person.money)
+            medicine = float(person.medicine)
+            energy = float(person.energy)
+            shelter = float(person.shelter)
+            health = float(person.health)
+            ideology = float(person.ideology)
+
+            sum_food += food
+            sum_money += money
+            sum_medicine += medicine
+            sum_energy += energy
+            sum_shelter += shelter
+            sum_health += health
+            sum_ideology += ideology
+            sum_taxes += float(person.taxes_paid)
+            sum_welfare += float(person.welfare_received)
+            if ideology < 0:
+                left_leaning += 1
+            else:
+                right_leaning += 1
+
+            lid = int(person.location_id)
+            loc_n[lid] += 1
+            loc_food[lid] += food
+            loc_money[lid] += money
+            loc_health[lid] += health
+
+            bucket = social.get(person.social_class)
+            if bucket is not None:
+                bucket[0] += 1
+                bucket[1] += money
+                bucket[2] += food
+                bucket[3] += shelter
+                bucket[4] += health
+                bucket[5] += ideology
+                bucket[6] += float(person.work_experience)
+
+            if person.is_working_age:
+                workforce += 1
+                employed += int(person.employer_id is not None)
+
         n = max(1, alive)
         conn = self.store.conn
         sid = self.store.simulation_id
@@ -181,8 +154,8 @@ class AggressiveParallelAgentWorld(RamAggressiveWorld):
             "INSERT INTO daily_stats VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 sid, day, alive,
-                stats["food"] / n, stats["money"] / n, stats["medicine"] / n,
-                stats["energy"] / n, stats["shelter"] / n, stats["health"] / n,
+                sum_food / n, sum_money / n, sum_medicine / n,
+                sum_energy / n, sum_shelter / n, sum_health / n,
                 self.total_helps, self.total_thefts, self.total_attacks,
                 self.total_observations, self.total_deaths,
                 self.total_mobility_changes,
@@ -192,14 +165,14 @@ class AggressiveParallelAgentWorld(RamAggressiveWorld):
         location_rows = []
         for location in self.locations:
             lid = location.id
-            count = stats["loc_n"][lid]
+            count = loc_n[lid]
             denom = max(1, count)
             location_rows.append(
                 (
                     sid, day, lid, count,
-                    stats["loc_food"][lid] / denom,
-                    stats["loc_money"][lid] / denom,
-                    stats["loc_health"][lid] / denom,
+                    loc_food[lid] / denom,
+                    loc_money[lid] / denom,
+                    loc_health[lid] / denom,
                     self.local_crime_rate(lid),
                 )
             )
@@ -212,14 +185,14 @@ class AggressiveParallelAgentWorld(RamAggressiveWorld):
             "INSERT INTO political_stats VALUES(?,?,?,?,?,?,?,?,?)",
             (
                 sid, day, self.politics.government.id, self.politics.treasury,
-                stats["ideology"] / n, stats["left"], stats["right"],
-                stats["taxes"] / n, stats["welfare"] / n,
+                sum_ideology / n, left_leaning, right_leaning,
+                sum_taxes / n, sum_welfare / n,
             ),
         )
 
         social_rows = []
         for name in _SOCIAL_CLASSES:
-            bucket = stats["social"][name]
+            bucket = social[name]
             count = bucket[0]
             denom = max(1, count)
             social_rows.append(
@@ -235,8 +208,6 @@ class AggressiveParallelAgentWorld(RamAggressiveWorld):
             social_rows,
         )
 
-        workforce = int(stats["workforce"])
-        employed = int(stats["employed"])
         active = [e for e in self.labor_market.employers if e.alive]
         unemployed = max(0, workforce - employed)
         conn.execute(
@@ -277,7 +248,6 @@ class AggressiveParallelAgentWorld(RamAggressiveWorld):
 
         if day % MOBILITY_INTERVAL_DAYS == 0:
             self.mobility_cycle()
-            self._eod_population_stats = None
 
         police_snapshot = self.police.end_day()
         self._write_population_stats_fast(day, police_snapshot)

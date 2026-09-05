@@ -1,6 +1,9 @@
 """SoA / Numba large-world fast lane layered over temporal BSP."""
 
+from math import ceil
 from time import perf_counter
+
+import numpy as np
 
 from .aggressive_jit import JIT_ENABLED
 from .aggressive_soa import (
@@ -17,12 +20,13 @@ from .aggressive_economy import PROFESSION_NAMES, SOCIAL_CLASSES
 from .aggressive_world_scale import AggressiveParallelAgentWorld as ScaleAggressiveWorld
 from .aggressive_world_temporal import AggressiveParallelAgentWorld as TemporalAggressiveWorld
 from .demographics import DEMOGRAPHIC_INTERVAL_DAYS
-from .labor_market import BUSINESS_INTERVAL_DAYS
+from .labor_market import BUSINESS_INTERVAL_DAYS, Employer
 from .politics import ELECTION_INTERVAL_DAYS
 from .professions import MOBILITY_INTERVAL_DAYS
 
 
 _SOA_MIN_POPULATION = 100_000
+_WELFARE_PHASE = 0x57454C46
 
 
 class AggressiveParallelAgentWorld(TemporalAggressiveWorld):
@@ -34,6 +38,7 @@ class AggressiveParallelAgentWorld(TemporalAggressiveWorld):
             warmup_soa()
         super().__init__(*args, agent_workers=agent_workers, agent_worker_min_active=agent_worker_min_active, **kwargs)
         seed = args[4] if len(args) > 4 else kwargs.get("population_seed", 0)
+        self._soa_seed = int(seed)
         self.soa_mode = bool(JIT_ENABLED and self.temporal_mode and len(self.people) >= _SOA_MIN_POPULATION)
         self.soa_state = None
         self.soa_memory = None
@@ -160,22 +165,223 @@ class AggressiveParallelAgentWorld(TemporalAggressiveWorld):
         self._domain_location_population = {int(loc.id): self.population_index.population(loc.id) for loc in self.locations}
         self._record_phase("soa_cold_resync", started)
 
+    def _soa_welfare_cycle(self, day):
+        """Apply monthly welfare directly to authoritative SoA state."""
+        party = self.politics.government
+        treasury = float(self.politics.treasury)
+        base_cost = int(party.welfare_cash + party.welfare_food)
+        if treasury < base_cost or base_cost <= 0:
+            return 0
+        n = len(self.people)
+        alive = self.soa_state.flags[B_ALIVE, :n] != 0
+        money = self.soa_state.floats[F_MONEY, :n]
+        eligible = np.flatnonzero(alive & (money <= float(party.welfare_money_threshold)))
+        if eligible.size == 0:
+            return 0
+        rng = np.random.default_rng((self._soa_seed ^ (int(day) << 17) ^ _WELFARE_PHASE) & ((1 << 63) - 1))
+        medicine = rng.random(eligible.size) < float(party.welfare_medicine_chance)
+        costs = np.full(eligible.size, base_cost, dtype=np.int64)
+        costs += medicine.astype(np.int64) * 2
+        cumulative = np.cumsum(costs, dtype=np.int64)
+        count = int(np.searchsorted(cumulative, treasury, side="right"))
+        if count <= 0:
+            return 0
+        ids = eligible[:count]
+        med = medicine[:count]
+        actual_costs = costs[:count]
+        self.soa_state.floats[F_MONEY, ids] += float(party.welfare_cash)
+        self.soa_state.ints[I_FOOD, ids] += int(party.welfare_food)
+        if np.any(med):
+            self.soa_state.ints[I_MED, ids[med]] += 1
+        self.soa_state.floats[F_WELFARE, ids] += actual_costs.astype(np.float64)
+        shifts = np.minimum(0.0035, actual_costs.astype(np.float64) * 0.00045)
+        self.soa_state.floats[F_IDEOLOGY, ids] = np.maximum(
+            -1.0,
+            self.soa_state.floats[F_IDEOLOGY, ids] - shifts,
+        )
+        self.politics.treasury = max(0.0, treasury - float(cumulative[count - 1]))
+        return count
+
+    def _soa_business_cycle(self, day):
+        """Run the firm review from aggregate employer counts, without Person scans."""
+        n = len(self.people)
+        ints = self.soa_state.ints
+        flags = self.soa_state.flags
+        alive_mask = flags[B_ALIVE, :n] != 0
+        changes = []
+        for employer in self.labor_market.employers:
+            if not employer.alive:
+                continue
+            employee_count = int(self._domain_employee_counts.get(int(employer.id), 0))
+            margin = float(employer.revenue_since_review - employer.payroll_since_review)
+            if employer.cash < 4 or (
+                margin < -22 and employer.cash < max(35, employer.capacity * 2)
+            ):
+                employer.alive = False
+                mask = alive_mask & (ints[I_EMPLOYER, :n] == int(employer.id))
+                laid_off = int(np.count_nonzero(mask))
+                ints[I_EMPLOYER, :n][mask] = -1
+                self._domain_employee_counts[int(employer.id)] = 0
+                employer._domain_employee_count = 0
+                changes.append(("closed", employer, {"laid_off_count": laid_off}))
+            elif (
+                margin > employer.capacity * 2.5
+                and employer.cash > employer.capacity * 15
+                and employer.capacity < 1000
+            ):
+                old = employer.capacity
+                employer.capacity += max(1, min(20, employer.capacity // 20))
+                changes.append(("expanded", employer, (old, employer.capacity)))
+            elif margin < -8 and employer.capacity > 8 and employee_count < employer.capacity * 0.7:
+                old = employer.capacity
+                employer.capacity = max(8, int(employer.capacity * 0.95))
+                changes.append(("contracted", employer, (old, employer.capacity)))
+            employer.revenue_since_review = 0.0
+            employer.payroll_since_review = 0.0
+            employer.units_produced_since_review = 0.0
+
+        alive_count = int(np.count_nonzero(alive_mask))
+        employed = int(np.count_nonzero(alive_mask & (ints[I_EMPLOYER, :n] >= 0)))
+        unemployment = (alive_count - employed) / alive_count if alive_count else 0.0
+        if unemployment > 0.18 and self.rng.random() < min(0.65, unemployment):
+            living_locations = list(self.labor_market.by_location)
+            if living_locations:
+                location_id = self.rng.choice(living_locations)
+                good = "food" if self.rng.random() < 0.78 else "medicine"
+                capacity = self.rng.randint(20, 80)
+                employer = Employer(
+                    id=self.labor_market.next_employer_id,
+                    name=f"New Venture {self.labor_market.next_employer_id}",
+                    location_id=location_id,
+                    kind="new_venture",
+                    capacity=capacity,
+                    base_wage=self.rng.uniform(4.5, 6.5),
+                    cash=capacity * self.rng.uniform(50, 90),
+                    productivity=self.rng.uniform(0.95, 1.15),
+                    preferred_professions=("laborer", "service_worker", "technician", "trader"),
+                    output_good=good,
+                    output_per_shift=self.rng.uniform(1.5, 3.0) if good == "food" else self.rng.uniform(0.45, 0.9),
+                )
+                self.labor_market.next_employer_id += 1
+                self.labor_market._add_employer(employer)
+                self._domain_employee_counts[int(employer.id)] = 0
+                employer._domain_employee_count = 0
+                changes.append(("created", employer, None))
+
+        for action, employer, detail in changes:
+            self.store.sync_employer(employer)
+            self.store.event(
+                day,
+                self.next_sequence(),
+                f"employer_{action}",
+                employer_id=employer.id,
+                employer=employer.name,
+                location_id=employer.location_id,
+                capacity=employer.capacity,
+                cash=round(employer.cash, 2),
+                detail=detail,
+            )
+
+        for lid, district in self.police.districts.items():
+            population = int(self._domain_location_population.get(int(lid), 0))
+            district.officers = (
+                max(1, ceil(population * self.police.officers_per_1000 / 1000.0))
+                if population else 0
+            )
+        return len(changes)
+
+    def _apply_soa_eod_stats(self, stats):
+        old_alive = int(self.alive_count)
+        new_alive = int(stats.get("alive", old_alive))
+        if new_alive < old_alive:
+            self.total_deaths += old_alive - new_alive
+        self.alive_count = new_alive
+        self.demographics.working_age_count = int(stats.get("workforce", 0))
+        self.invalidate_living_cache()
+        loc_stats = stats.get("locations", {})
+        for loc in self.locations:
+            lid = int(loc.id)
+            count = int(loc_stats.get(lid, (0,))[0]) if lid in loc_stats else 0
+            self._domain_location_population[lid] = count
+            self.goods_market.set_population(lid, count)
+        authoritative_counts = {
+            int(eid): int(count)
+            for eid, count in stats.get("employer_counts", {}).items()
+        }
+        for employer in self.labor_market.employers:
+            count = authoritative_counts.get(int(employer.id), 0)
+            self._domain_employee_counts[int(employer.id)] = count
+            employer._domain_employee_count = count
+        for lid in self.crime_history:
+            self.crime_history[lid].append(int(self.daily_crimes.get(lid, 0)))
+        self.daily_crimes.clear()
+
+    def _run_soa_eod_only(self, day):
+        """Execute only end-of-day decay/statistics in the compiled domain kernel."""
+        self._initialize_soa()
+        active = self._rebuild_soa_index()
+        if active <= 0:
+            return None
+        packet = self._build_temporal_packet()
+        # The action pass placed today's crimes in daily_crimes. The EOD-only
+        # kernel has no action counters, so fold that count into the history sum
+        # while preserving the denominator expected by the normal fused kernel.
+        histories = dict(packet.get("crime_history", {}))
+        for lid, history in histories.items():
+            row = list(history)
+            todays = int(self.daily_crimes.get(int(lid), 0))
+            if row:
+                row[-1] = int(row[-1]) + todays
+            histories[int(lid)] = tuple(row)
+        packet["crime_history"] = histories
+        started = perf_counter()
+        _results, stats = self.soa_pool.run_day(
+            day,
+            0,
+            self.encounter_sample,
+            self.max_witnesses,
+            self.visibility,
+            packet,
+            fuse_eod=True,
+        )
+        self._record_phase("soa_cold_eod_compiled", started)
+        self._apply_soa_eod_stats(stats)
+        return stats
+
+    def _run_soa_cold_day_legacy(self, day):
+        """Exact Python lifecycle fallback for rare mobility boundaries."""
+        self.current_day = day
+        self._run_soa_domain(day, fuse_eod=False)
+        self._soa_reconcile_to_world(count_new_deaths=True)
+        for shipment in self.transport.rebalance(day):
+            self.store.shipment(shipment)
+        if day % BUSINESS_INTERVAL_DAYS == 0:
+            self.welfare_cycle()
+            self.business_cycle()
+            self.police.rebalance()
+        ScaleAggressiveWorld._run_parallel_end_of_day(self)
+        self.goods_market.reprice()
+        if day % MOBILITY_INTERVAL_DAYS == 0:
+            self.mobility_cycle()
+        police_snapshot = self.police.end_day()
+        ScaleAggressiveWorld._write_population_stats_fast(self, day, police_snapshot)
+        self.store.commit_day()
+        self.demographics.cycle(day)
+        self.demographics.write_stats(day)
+        self.store.commit_day()
+        self._resync_soa_from_world()
+
     def _run_soa_cold_day(self, day):
-        # The SoA state is authoritative between cold barriers. Reconstructing the
-        # entire Python world before this day's action phase is redundant: the
-        # packet uses aggregate economy / market / police state, which is already
-        # kept current every hot day. Reconcile exactly once, after the actions,
-        # when monthly lifecycle code genuinely needs Person objects and indexes.
         barrier_started = perf_counter()
         self.current_day = day
-        if day == 1 or (day - 1) % ELECTION_INTERVAL_DAYS == 0:
-            self.run_election()
+        if day % MOBILITY_INTERVAL_DAYS == 0:
+            self._run_soa_cold_day_legacy(day)
+            self._record_phase("soa_cold_barrier_total", barrier_started)
+            return
 
         started = perf_counter()
         self._run_soa_domain(day, fuse_eod=False)
         self._record_phase("soa_cold_actions", started)
-
-        self._soa_reconcile_to_world(count_new_deaths=True)
 
         started = perf_counter()
         for shipment in self.transport.rebalance(day):
@@ -184,39 +390,31 @@ class AggressiveParallelAgentWorld(TemporalAggressiveWorld):
 
         started = perf_counter()
         if day % BUSINESS_INTERVAL_DAYS == 0:
-            self.welfare_cycle()
-            self.business_cycle()
-            self.police.rebalance()
-        self._record_phase("soa_cold_business", started)
+            self._soa_welfare_cycle(day)
+            self._soa_business_cycle(day)
+        self._record_phase("soa_cold_business_soa", started)
 
-        started = perf_counter()
-        ScaleAggressiveWorld._run_parallel_end_of_day(self)
-        self._record_phase("soa_cold_eod", started)
-
+        stats = self._run_soa_eod_only(day)
         self.goods_market.reprice()
+        if stats is None:
+            self._record_phase("soa_cold_barrier_total", barrier_started)
+            return
 
         started = perf_counter()
-        if day % MOBILITY_INTERVAL_DAYS == 0:
-            self.mobility_cycle()
-            # EOD fused stats describe the pre-mobility population. Preserve the
-            # legacy reporting order by forcing the stats writer to rescan only
-            # on the rare mobility boundary.
-            self._eod_population_stats = None
-        self._record_phase("soa_cold_mobility", started)
-
-        started = perf_counter()
-        police_snapshot = self.police.end_day()
-        ScaleAggressiveWorld._write_population_stats_fast(self, day, police_snapshot)
+        police_snapshot = self._finish_temporal_police(stats)
+        self._write_temporal_stats(day, stats, police_snapshot)
         self.store.commit_day()
-        self._record_phase("soa_cold_stats", started)
+        self._record_phase("soa_cold_stats_soa", started)
 
+        # Demographics still owns households, pregnancies and Person creation.
+        # Materialize exactly once after EOD, run that monthly lifecycle, then
+        # return its changes to the authoritative SoA arrays.
+        self._soa_reconcile_to_world(count_new_deaths=False)
         started = perf_counter()
-        if day % DEMOGRAPHIC_INTERVAL_DAYS == 0:
-            self.demographics.cycle(day)
-            self.demographics.write_stats(day)
-            self.store.commit_day()
+        self.demographics.cycle(day)
+        self.demographics.write_stats(day)
+        self.store.commit_day()
         self._record_phase("soa_cold_demographics", started)
-
         self._resync_soa_from_world()
         self._record_phase("soa_cold_barrier_total", barrier_started)
 
