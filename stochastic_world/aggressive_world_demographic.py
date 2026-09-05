@@ -7,6 +7,7 @@ boundaries.
 
 from time import perf_counter
 
+from .aggressive_balanced_pool import BalancedSoADomainPool
 from .aggressive_demographics import SoADemographicState
 from .aggressive_mobility import run_soa_mobility
 from .aggressive_soa import B_WORKING_AGE
@@ -23,6 +24,20 @@ class AggressiveParallelAgentWorld(SoAAggressiveWorld):
         self.soa_demographics = None
         self._soa_demographics_initialized = False
         if self.soa_mode:
+            # The base SoA pool has not started yet at construction time. Replace
+            # its fixed location_id % workers ownership with a persistent pool
+            # whose owner sets are greedily rebalanced from live CSR counts on
+            # every BSP superstep.
+            old_pool = self.soa_pool
+            worker_count = int(getattr(old_pool, "worker_count", 0))
+            self.soa_pool = BalancedSoADomainPool(
+                self._soa_seed,
+                self.soa_state,
+                self.soa_memory,
+                self.soa_index,
+                len(self.locations),
+                workers=worker_count,
+            )
             self.soa_demographics = SoADemographicState(
                 self.soa_state.capacity,
                 self._soa_seed,
@@ -129,6 +144,14 @@ class AggressiveParallelAgentWorld(SoAAggressiveWorld):
                 "  aggressive demographic SoA: "
                 f"local={self.soa_demographics.allocated_bytes / (1024 * 1024):.1f}MiB"
             )
+            if self.soa_pool is not None:
+                summary = self.soa_pool.summary()
+                if summary.get("days"):
+                    print(
+                        "  aggressive SoA load balance: "
+                        f"avg_max/mean={summary.get('balance_avg_ratio', 1.0):.3f} "
+                        f"max={summary.get('balance_max_ratio', 1.0):.3f}"
+                    )
         super().close_parallel()
 
 
