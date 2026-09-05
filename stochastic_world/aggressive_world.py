@@ -1,5 +1,5 @@
 """Public entry point for the RAM-first aggressive engine."""
 
-from .aggressive_world_ram import AggressiveParallelAgentWorld
+from .aggressive_world_scale import AggressiveParallelAgentWorld
 
 __all__ = ["AggressiveParallelAgentWorld"]
