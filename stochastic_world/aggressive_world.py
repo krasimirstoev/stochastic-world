@@ -50,6 +50,7 @@ class AggressiveParallelAgentWorld(_BaseWorld):
         }
         self._aggressive_election_seconds = 0.0
         self._aggressive_election_calls = 0
+        self._aggressive_soa_election_calls = 0
 
     def _seed_employment(self):
         started = perf_counter()
@@ -68,8 +69,23 @@ class AggressiveParallelAgentWorld(_BaseWorld):
         forced = self.current_day == 1 and self.politics.initial_government in ("left", "right")
         votes = {"left": 0, "right": 0}
 
+        # Day 1 still uses the original Person path when the result is not
+        # forced.  Those objects are authoritative before the first action and
+        # this preserves the established seed-12345 opening election.  Later
+        # elections read the authoritative SoA arrays directly and avoid a full
+        # 100k+/million-agent materialization barrier.
+        soa_election = bool(
+            self.current_day != 1
+            and getattr(self, "soa_mode", False)
+            and getattr(self, "_soa_initialized", False)
+        )
         if forced:
             winner = self.politics.party_by_id(self.politics.initial_government)
+        elif soa_election:
+            from .aggressive_election import run_soa_election
+
+            votes, winner = run_soa_election(self, self.current_day)
+            self._aggressive_soa_election_calls += 1
         else:
             crime_rates = self.crime_rates()
             for person in self.people:
@@ -88,8 +104,7 @@ class AggressiveParallelAgentWorld(_BaseWorld):
         self.politics.election_number += 1
         self.politics.last_election_day = self.current_day
         # Large compact runs preserve aggregate election outcomes but deliberately
-        # omit per-voter ballot persistence. Day-1 forced governments skip voting
-        # entirely because the result is predetermined by configuration.
+        # omit per-voter ballot persistence.
         self.store.election(self.current_day, self.politics, votes, (), winner)
         self.store.event(
             self.current_day,
@@ -101,6 +116,7 @@ class AggressiveParallelAgentWorld(_BaseWorld):
             representative=self.politics.representatives[winner.id],
             forced=int(forced),
             aggregate_only=1,
+            soa=int(soa_election),
         )
         self._aggressive_election_seconds += perf_counter() - started
         self._aggressive_election_calls += 1
@@ -128,6 +144,7 @@ class AggressiveParallelAgentWorld(_BaseWorld):
                 print(
                     "  aggressive aggregate elections: "
                     f"calls={self._aggressive_election_calls} "
+                    f"soa={self._aggressive_soa_election_calls} "
                     f"wall={self._aggressive_election_seconds:.3f}s"
                 )
         super().close_parallel()

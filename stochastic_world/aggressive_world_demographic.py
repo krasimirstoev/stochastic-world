@@ -1,8 +1,7 @@
 """Demographic-authoritative layer for the 100k+ aggressive SoA engine.
 
 Normal monthly lifecycle boundaries stay entirely in array state. Full Person
-materialization is reserved for elections/reporting and explicit fallback
-boundaries.
+materialization is reserved for reporting and explicit fallback boundaries.
 """
 
 from time import perf_counter
@@ -12,7 +11,9 @@ from .aggressive_demographics import SoADemographicState
 from .aggressive_mobility import run_soa_mobility
 from .aggressive_soa import B_WORKING_AGE
 from .aggressive_world_soa import AggressiveParallelAgentWorld as SoAAggressiveWorld
+from .demographics import DEMOGRAPHIC_INTERVAL_DAYS
 from .labor_market import BUSINESS_INTERVAL_DAYS
+from .politics import ELECTION_INTERVAL_DAYS
 from .professions import MOBILITY_INTERVAL_DAYS
 
 
@@ -125,6 +126,34 @@ class AggressiveParallelAgentWorld(SoAAggressiveWorld):
         self._record_phase("soa_cold_demographics_soa", started)
 
         self._record_phase("soa_cold_barrier_total", barrier_started)
+
+    def run_day(self, day):
+        if not self.soa_mode:
+            return super().run_day(day)
+        election_day = day == 1 or (day - 1) % ELECTION_INTERVAL_DAYS == 0
+        if day % DEMOGRAPHIC_INTERVAL_DAYS == 0:
+            return self._run_soa_cold_day(day)
+
+        self.current_day = day
+        if election_day:
+            # Day 1 deliberately uses the original Person election because the
+            # initial objects are still authoritative. Later elections are
+            # handled by the public aggressive world's SoA aggregate path.
+            if day != 1:
+                self._initialize_soa()
+            self.run_election()
+
+        total_started = perf_counter()
+        _results, stats = self._run_soa_domain(day, fuse_eod=True)
+        self._record_phase("actions_total", total_started)
+        if stats is None:
+            return
+        for shipment in self.transport.rebalance(day):
+            self.store.shipment(shipment)
+        self.goods_market.reprice()
+        police_snapshot = self._finish_temporal_police(stats)
+        self._write_temporal_stats(day, stats, police_snapshot)
+        self.store.commit_day()
 
     def prepare_reporting(self):
         super().prepare_reporting()
